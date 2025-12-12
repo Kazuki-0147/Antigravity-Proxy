@@ -33,6 +33,15 @@ EOF
 docker compose up -d --build
 ```
 
+## 添加账号（跑起来后先做这个）
+
+1) 打开管理面板：`http://localhost:8088`（端口以 `.env` 为准）  
+2) 使用 `ADMIN_PASSWORD` 登录  
+3) 进入 `Accounts`：
+   - **OAuth 绑定**：点 `OAuth` → 在新窗口授权 → 复制回调 URL 粘贴回面板完成添加
+   - **手动添加**：点 `添加` → 填 `email` + `refresh_token` 保存
+4) 可选：点一次“刷新所有 Token 及配额”，让状态/等级/配额同步到最新
+
 ## 能力概览
 
 - OpenAI：`POST /v1/chat/completions`、`GET /v1/models`
@@ -113,4 +122,3 @@ curl http://localhost:8088/v1/models -H "Authorization: Bearer sk-your-api-key"
 ## License
 
 MIT
-
