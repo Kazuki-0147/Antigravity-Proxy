@@ -89,6 +89,12 @@ export default async function openaiRoutes(fastify) {
                         const chunks = convertSSEChunk(data, requestId, model, isThinkingModel(model));
                         if (chunks) {
                             for (const chunk of chunks) {
+                                // 若 converter 生成了 error chunk，标记本次请求为 error（但仍以 SSE 方式返回）
+                                if (chunk?.error?.message) {
+                                    status = 'error';
+                                    errorMessage = chunk.error.message;
+                                    errorResponseForLog = chunk;
+                                }
                                 streamChunksForLog.push(chunk);
                                 reply.raw.write(`data: ${JSON.stringify(chunk)}\n\n`);
                             }
@@ -108,6 +114,23 @@ export default async function openaiRoutes(fastify) {
                     },
                     abortController.signal
                 );
+
+                // 上游有时会返回“HTTP 200 + SSE 结束”，但中间没有任何 candidates（例如安全拦截/空回复）
+                // 这种情况下给客户端一个明确的 error chunk，避免出现“空回复且不报错”
+                if (status === 'success' && streamChunksForLog.length === 0) {
+                    status = 'error';
+                    errorMessage = 'Upstream returned empty response (no candidates)';
+                    const errorChunk = {
+                        error: {
+                            message: errorMessage,
+                            type: 'api_error',
+                            code: 'empty_upstream_response'
+                        }
+                    };
+                    errorResponseForLog = errorChunk;
+                    streamChunksForLog.push(errorChunk);
+                    reply.raw.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+                }
 
                 // 发送结束标志
                 reply.raw.write('data: [DONE]\n\n');

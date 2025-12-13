@@ -542,6 +542,15 @@ export function convertResponse(antigravityResponse, requestId, model, includeTh
         const candidate = data.response?.candidates?.[0];
         const usage = data.response?.usageMetadata;
 
+        if (!candidate) {
+            const promptFeedback = data.response?.promptFeedback;
+            const blockReason = promptFeedback?.blockReason || promptFeedback?.blockReasonMessage;
+            if (blockReason) {
+                throw new Error(`Upstream blocked request: ${blockReason}`);
+            }
+            throw new Error('Upstream returned no candidates');
+        }
+
         const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
 
         // 提取文本内容
@@ -931,6 +940,15 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
         const data = antigravityResponse;
         const candidate = data.response?.candidates?.[0];
         const usage = data.response?.usageMetadata;
+
+        if (!candidate) {
+            const promptFeedback = data.response?.promptFeedback;
+            const blockReason = promptFeedback?.blockReason || promptFeedback?.blockReasonMessage;
+            if (blockReason) {
+                throw new Error(`Upstream blocked request: ${blockReason}`);
+            }
+            throw new Error('Upstream returned no candidates');
+        }
 
         const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
 

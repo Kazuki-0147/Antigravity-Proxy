@@ -63,6 +63,29 @@ export async function streamChat(account, request, onData, onError, signal = nul
                 if (line.startsWith('data: ')) {
                     const data = line.slice(6).trim();
                     if (data && data !== '[DONE]') {
+                        // 上游可能在 SSE 中返回结构化错误/安全拦截信息（HTTP 200 但无 candidates）
+                        // 这种情况下，如果我们不处理，客户端会看到“空回复且不报错”
+                        try {
+                            const parsed = JSON.parse(data);
+                            const upstreamError = parsed?.error;
+                            const promptFeedback = parsed?.response?.promptFeedback;
+                            const blockReason = promptFeedback?.blockReason || promptFeedback?.blockReasonMessage;
+
+                            if (upstreamError?.message) {
+                                throw new Error(upstreamError.message);
+                            }
+                            if (blockReason) {
+                                throw new Error(`Upstream blocked request: ${blockReason}`);
+                            }
+                        } catch (e) {
+                            // JSON.parse 失败：忽略（走 onData）
+                            // JSON.parse 成功但 throw：会被外层 catch 捕获并走 onError
+                            if (e instanceof SyntaxError) {
+                                // ignore
+                            } else if (e instanceof Error) {
+                                throw e;
+                            }
+                        }
                         try {
                             onData(data);
                         } catch {
@@ -87,6 +110,8 @@ export async function streamChat(account, request, onData, onError, signal = nul
 
         if (onError) {
             onError(error);
+            // 流式场景下：回调已向客户端写入错误事件/chunk，这里不再抛出，避免外层重复响应
+            return;
         }
         throw error;
     }
