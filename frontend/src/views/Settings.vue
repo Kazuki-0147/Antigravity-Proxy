@@ -21,6 +21,7 @@ const models = [
   { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
   { id: 'gemini-3-pro-high', name: 'Gemini 3 Pro (High)' },
   { id: 'gemini-3-pro-low', name: 'Gemini 3 Pro (Low)' },
+  { id: 'rev19-uic3-1p', name: 'rev19-uic3-1p' },
   { id: 'claude-opus-4-5', name: 'Claude Opus 4.5' },
   { id: 'claude-opus-4-5-thinking', name: 'Claude Opus 4.5 (Thinking)' },
   { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5' },
