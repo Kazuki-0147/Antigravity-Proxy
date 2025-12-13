@@ -47,6 +47,8 @@ export const AVAILABLE_MODELS = [
     { id: 'gemini-2.5-flash-thinking', displayName: 'Gemini 2.5 Flash (Thinking)', provider: 'google', supportsImages: true, supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65535 },
     { id: 'gemini-2.5-flash-lite', displayName: 'Gemini 2.5 Flash Lite', provider: 'google', supportsImages: false, supportsThinking: false, maxTokens: 1048576, maxOutputTokens: 65535 },
     { id: 'gemini-3-pro-image', displayName: 'Gemini 3 Pro Image', provider: 'google', supportsImages: true, supportsThinking: false },
+    // 上游内部 revision 模型：可以调用，但小 max_tokens 可能只输出思考 token 而无文本 parts
+    { id: 'rev19-uic3-1p', displayName: 'rev19-uic3-1p', provider: 'google', supportsImages: false, supportsThinking: false },
     { id: 'claude-opus-4-5', displayName: 'Claude Opus 4.5', provider: 'anthropic', supportsImages: true, supportsThinking: false, maxTokens: 200000, maxOutputTokens: 64000 },
     { id: 'claude-opus-4-5-thinking', displayName: 'Claude Opus 4.5 (Thinking)', provider: 'anthropic', supportsImages: true, supportsThinking: true, maxTokens: 200000, maxOutputTokens: 64000 },
     { id: 'claude-sonnet-4-5', displayName: 'Claude Sonnet 4.5', provider: 'anthropic', supportsImages: true, supportsThinking: false, maxTokens: 200000, maxOutputTokens: 64000 },
