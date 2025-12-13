@@ -175,8 +175,7 @@ export default async function anthropicRoutes(fastify) {
             const msg = error.message || '';
             const isCapacityError =
                 msg.includes('exhausted your capacity on this model') ||
-                msg.includes('Resource has been exhausted') ||
-                msg.includes('Invalid response structure');
+                msg.includes('Resource has been exhausted');
 
             // 容量耗尽：不把账号标成 error，只做短暂冷却，并返回 429
             if (account && isCapacityError) {

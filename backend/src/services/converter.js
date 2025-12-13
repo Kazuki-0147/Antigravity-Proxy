@@ -338,14 +338,15 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
         const data = JSON.parse(antigravityData);
         const candidate = data.response?.candidates?.[0];
 
-        if (!candidate?.content?.parts) {
+        if (!candidate) {
             return null;
         }
 
         const chunks = [];
         const stateKey = requestId;
+        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
 
-        for (const part of candidate.content.parts) {
+        for (const part of parts) {
             // 处理思维链内容
             if (part.thought) {
                 if (includeThinking) {
@@ -458,7 +459,7 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
         }
 
         // 处理结束标志
-        if (candidate.finishReason === 'STOP') {
+        if (candidate.finishReason === 'STOP' || candidate.finishReason === 'MAX_TOKENS') {
             // 如果还在思维链中，先关闭标签
             if (thinkingState.get(stateKey)) {
                 chunks.push({
@@ -485,7 +486,7 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
                 choices: [{
                     index: 0,
                     delta: {},
-                    finish_reason: 'stop'
+                    finish_reason: candidate.finishReason === 'STOP' ? 'stop' : 'length'
                 }]
             });
         }
@@ -505,15 +506,13 @@ export function convertResponse(antigravityResponse, requestId, model, includeTh
         const candidate = data.response?.candidates?.[0];
         const usage = data.response?.usageMetadata;
 
-        if (!candidate?.content?.parts) {
-            throw new Error('Invalid response structure');
-        }
+        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
 
         // 提取文本内容
         let content = '';
         const toolCalls = [];
 
-        for (const part of candidate.content.parts) {
+        for (const part of parts) {
             // 处理思维链
             if (part.thought) {
                 if (includeThinking) {
@@ -545,7 +544,7 @@ export function convertResponse(antigravityResponse, requestId, model, includeTh
 
         const message = {
             role: 'assistant',
-            content: content || null
+            content: content
         };
 
         if (toolCalls.length > 0) {
@@ -886,15 +885,13 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
         const candidate = data.response?.candidates?.[0];
         const usage = data.response?.usageMetadata;
 
-        if (!candidate?.content?.parts) {
-            throw new Error('Invalid response structure');
-        }
+        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
 
         const content = [];
         let thinkingText = '';
         let hasThinking = false;
 
-        for (const part of candidate.content.parts) {
+        for (const part of parts) {
             // 收集思维链内容
             if (part.thought) {
                 hasThinking = true;
@@ -992,7 +989,7 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
         const candidate = data.response?.candidates?.[0];
         const usage = data.response?.usageMetadata;
 
-        if (!candidate?.content?.parts) {
+        if (!candidate) {
             return { events: [], state };
         }
 
@@ -1000,8 +997,9 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
         let newState = { ...state };
 
         // 先分离 thinking 和非 thinking 的 parts
-        const thinkingParts = candidate.content.parts.filter(p => p.thought);
-        const otherParts = candidate.content.parts.filter(p => !p.thought);
+        const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+        const thinkingParts = parts.filter(p => p.thought);
+        const otherParts = parts.filter(p => !p.thought);
 
         // 先处理 thinking（确保 thinking 在前，index 0）
         for (const part of thinkingParts) {
