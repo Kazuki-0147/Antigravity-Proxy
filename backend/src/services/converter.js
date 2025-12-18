@@ -122,14 +122,14 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         msg.role === 'tool'
     );
 
-    // 如果有工具相关内容，禁用 thinking（因为 thinking 块需要签名，无法伪造）
+    // 检查是否是 Claude 模型（Claude 不支持 topP，且 extended thinking 在 tool_use 链路需要签名）
+    const isClaudeModel = model.includes('claude');
+
+    // OpenAI 端：仅对 Claude 在“工具相关”场景禁用 thinking（Gemini 支持 tools + thinking）
     let enableThinking = isThinkingModel(model);
-    if (enableThinking && (hasTools || hasToolCallsInHistory || hasToolResultsInHistory)) {
+    if (enableThinking && isClaudeModel && (hasTools || hasToolCallsInHistory || hasToolResultsInHistory)) {
         enableThinking = false;
     }
-
-    // 检查是否是 Claude 模型（Claude 不支持 topP）
-    const isClaudeModel = model.includes('claude');
 
     // 获取思考预算（优先使用 thinking_budget，其次 budget_tokens，最后默认值）
     const thinkingBudget = thinking_budget ?? budget_tokens ?? DEFAULT_THINKING_BUDGET;
