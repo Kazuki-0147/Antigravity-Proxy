@@ -297,6 +297,21 @@ export default async function anthropicRoutes(fastify) {
         let anthropicRequest = request.body;
         const { stream = false, model } = anthropicRequest;
 
+        // 兼容：部分客户端不会传 metadata.user_id，但 Claude extended thinking 的 signature 回放/兜底逻辑需要一个稳定的 userKey。
+        // 这里用 API Key ID 作为 fallback，显著降低“多轮工具调用后 signature 丢失 -> thinking_downgrade”的概率。
+        try {
+            if (anthropicRequest && typeof anthropicRequest === 'object') {
+                const meta = (anthropicRequest.metadata && typeof anthropicRequest.metadata === 'object')
+                    ? anthropicRequest.metadata
+                    : {};
+                if (!meta.user_id) {
+                    anthropicRequest.metadata = { ...meta, user_id: `api_key:${request.apiKey?.id ?? 'unknown'}` };
+                }
+            }
+        } catch {
+            // ignore
+        }
+
         let account = null;
         let usage = null;
         let status = 'success';
@@ -471,6 +486,28 @@ export default async function anthropicRoutes(fastify) {
                     };
                     streamEventsForLog.push({ event: 'error', data: errorEvent });
                     reply.raw.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`);
+                }
+
+                // 上游偶发会“提前结束流”而不下发最终 finish/message_stop（客户端表现为：只输出一段 thinking 就断开）
+                // 这类情况对客户端来说是不可恢复的半包响应，这里明确返回 error event 方便前端重试/回滚。
+                if (status === 'success' && !abortController.signal.aborted && sawAnyUpstreamEvents && !sseState?.completed) {
+                    status = 'error';
+                    errorMessage = 'Upstream stream ended unexpectedly (missing message_stop)';
+                    const errorEvent = {
+                        type: 'error',
+                        error: {
+                            type: 'api_error',
+                            message: errorMessage,
+                            code: 'incomplete_upstream_stream'
+                        }
+                    };
+                    errorResponseForLog = errorEvent;
+                    streamEventsForLog.push({ event: 'error', data: errorEvent });
+                    try {
+                        reply.raw.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`);
+                    } catch {
+                        // ignore
+                    }
                 }
 
                 // 上游有时会返回“HTTP 200 + SSE 结束”但中间没有任何 events（例如安全拦截/空回复）

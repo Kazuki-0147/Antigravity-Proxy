@@ -7,6 +7,219 @@ import { getDatabase } from '../db/index.js';
 const DEFAULT_THINKING_BUDGET = 4096;
 const DEFAULT_TEMPERATURE = 1;
 
+// 工具结果内容过长会导致上游报 Prompt is too long。
+// 由于客户端会在每一轮把全部 tool_result 原样回放到下一次请求里，
+// 多次工具调用叠加后很容易超过模型上下文窗口。
+// 这里对“发往上游的 tool 输出”做可配置的截断/预算控制（不影响客户端看到的 tool_result 原文）。
+const TOOL_RESULT_MAX_CHARS = Number(process.env.TOOL_RESULT_MAX_CHARS || 12000);
+const TOOL_RESULT_TOTAL_MAX_CHARS = Number(process.env.TOOL_RESULT_TOTAL_MAX_CHARS || 80000);
+// 截断时保留尾部，避免丢失诸如 “Content truncated. Call the fetch tool with start_index=…” 等关键提示
+const TOOL_RESULT_TAIL_CHARS = Number(process.env.TOOL_RESULT_TAIL_CHARS || 1200);
+
+// 多工具链路时，很多客户端会把 max_tokens 设到极大（如 64k），导致“可用输入上下文”被挤压，
+// 更容易触发 Prompt is too long。这里提供一个可配置的上限（仅在请求包含 tools 或 tool_results 时生效）。
+const MAX_OUTPUT_TOKENS_WITH_TOOLS = Number(process.env.MAX_OUTPUT_TOKENS_WITH_TOOLS || 8192);
+
+const TOOL_RESULT_TRUNCATE_LOG = !['0', 'false', 'no', 'n', 'off'].includes(
+    String(process.env.TOOL_RESULT_TRUNCATE_LOG ?? 'true').trim().toLowerCase()
+);
+
+function logToolResultTruncation(payload) {
+    if (!TOOL_RESULT_TRUNCATE_LOG) return;
+    try {
+        const obj = payload && typeof payload === 'object' ? payload : {};
+        console.warn(JSON.stringify({ kind: 'tool_result_truncate', ...obj }));
+    } catch {
+        // ignore
+    }
+}
+
+function createToolOutputLimiter(ctx = {}) {
+    const total = Number.isFinite(TOOL_RESULT_TOTAL_MAX_CHARS) ? TOOL_RESULT_TOTAL_MAX_CHARS : 0;
+    return { remaining: total > 0 ? total : Infinity, ...ctx };
+}
+
+function extractTextFromToolJson(parsed) {
+    if (Array.isArray(parsed)) {
+        const texts = [];
+        for (const item of parsed) {
+            if (typeof item === 'string') {
+                if (item) texts.push(item);
+                continue;
+            }
+            if (item && typeof item === 'object') {
+                if (typeof item.text === 'string' && item.text) {
+                    texts.push(item.text);
+                    continue;
+                }
+                if (typeof item.content === 'string' && item.content) {
+                    texts.push(item.content);
+                    continue;
+                }
+            }
+        }
+        return texts.length > 0 ? texts.join('\n') : null;
+    }
+
+    if (parsed && typeof parsed === 'object') {
+        if (Array.isArray(parsed.content)) {
+            const parts = [];
+            for (const block of parsed.content) {
+                if (typeof block === 'string') {
+                    if (block) parts.push(block);
+                    continue;
+                }
+                if (block && typeof block === 'object') {
+                    if (typeof block.text === 'string' && block.text) {
+                        parts.push(block.text);
+                        continue;
+                    }
+                    if (typeof block.content === 'string' && block.content) {
+                        parts.push(block.content);
+                        continue;
+                    }
+                }
+            }
+            if (parts.length > 0) {
+                const isErr = parsed.isError ?? parsed.is_error;
+                const prefix = isErr ? '[tool_error]\n' : '';
+                return prefix + parts.join('\n');
+            }
+        }
+
+        if (typeof parsed.text === 'string' && parsed.text) return parsed.text;
+        if (typeof parsed.output === 'string' && parsed.output) return parsed.output;
+        if (typeof parsed.message === 'string' && parsed.message) return parsed.message;
+    }
+
+    return null;
+}
+
+function normalizeToolOutput(value) {
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed && (trimmed.startsWith('{') || trimmed.startsWith('['))) {
+            try {
+                const parsed = JSON.parse(trimmed);
+                const extracted = extractTextFromToolJson(parsed);
+                if (typeof extracted === 'string' && extracted) return extracted;
+            } catch {
+                // ignore
+            }
+        }
+        return value;
+    }
+
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
+function limitToolOutput(value, limiter = null, meta = {}) {
+    const raw = normalizeToolOutput(value);
+    const perToolMax = Number.isFinite(TOOL_RESULT_MAX_CHARS) ? TOOL_RESULT_MAX_CHARS : 0;
+    const totalRemaining = limiter && typeof limiter.remaining === 'number' ? limiter.remaining : Infinity;
+
+    // disabled: no per-tool cap + no total cap
+    if (!(perToolMax > 0) && !Number.isFinite(totalRemaining)) {
+        return raw;
+    }
+
+    let maxAllowed = Infinity;
+    if (perToolMax > 0) maxAllowed = Math.min(maxAllowed, perToolMax);
+    if (Number.isFinite(totalRemaining)) maxAllowed = Math.min(maxAllowed, totalRemaining);
+
+    if (!Number.isFinite(maxAllowed)) return raw;
+
+    if (maxAllowed <= 0) {
+        const omitted = '[antigravity-proxy] tool output omitted (prompt budget exceeded).';
+        if (limiter && Number.isFinite(limiter.remaining)) limiter.remaining = Math.max(0, limiter.remaining - omitted.length);
+        logToolResultTruncation({ ...meta, omitted: true, remaining: limiter?.remaining });
+        return omitted;
+    }
+
+    if (raw.length <= maxAllowed) {
+        if (limiter && Number.isFinite(limiter.remaining)) limiter.remaining = Math.max(0, limiter.remaining - raw.length);
+        return raw;
+    }
+
+    const separator = `\n\n[antigravity-proxy] tool output truncated (${raw.length} -> ${maxAllowed} chars). Showing head+tail.\n\n`;
+    let out = '';
+    if (separator.length >= maxAllowed) {
+        out = separator.slice(0, maxAllowed);
+    } else {
+        const wantsTail = Number.isFinite(TOOL_RESULT_TAIL_CHARS) && TOOL_RESULT_TAIL_CHARS > 0;
+        let tailLen = wantsTail ? Math.min(TOOL_RESULT_TAIL_CHARS, raw.length) : 0;
+        // 预留 separator + tail
+        let headLen = maxAllowed - separator.length - tailLen;
+        if (headLen < 0) {
+            // 退化：优先保留尽量多的尾部（保住 start_index 提示），头部为 0
+            tailLen = Math.max(0, maxAllowed - separator.length);
+            headLen = 0;
+        }
+        const tail = tailLen > 0 ? raw.slice(Math.max(0, raw.length - tailLen)) : '';
+        out = raw.slice(0, headLen) + separator + tail;
+    }
+
+    if (limiter && Number.isFinite(limiter.remaining)) limiter.remaining = Math.max(0, limiter.remaining - out.length);
+    logToolResultTruncation({ ...meta, truncated: true, before: raw.length, after: out.length, remaining: limiter?.remaining });
+    return out;
+}
+
+// Claude thinking + tool calling：上游在“工具 schema 没有 required 字段”时，偶发只输出 thinking 然后提前结束（不下发 tool_call）
+// 解决思路：
+// 1) 发往上游时：对 required 为空的工具 schema 注入一个内部 required 字段（保证模型能形成合法 tool_call）
+// 2) 回给客户端时：把这个内部字段从 tool_call args / tool_use input 中剥离（保持客户端工具入参不变）
+// 3) 客户端回放历史时：在转发到上游前把内部字段补回（避免上游校验历史 tool_call args 失败）
+const CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER = '__ag_required';
+const CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER_VALUE = true;
+
+function needsClaudeToolRequiredArgPlaceholder(schema) {
+    if (!schema || typeof schema !== 'object') return false;
+    const type = typeof schema.type === 'string' ? schema.type.toUpperCase() : '';
+    if (type !== 'OBJECT') return false;
+    const required = schema.required;
+    return !Array.isArray(required) || required.length === 0;
+}
+
+function injectClaudeToolRequiredArgPlaceholderIntoSchema(schema) {
+    if (!schema || typeof schema !== 'object') return schema;
+    if (!needsClaudeToolRequiredArgPlaceholder(schema)) return schema;
+
+    const wantsUpper = typeof schema.type === 'string' && schema.type === schema.type.toUpperCase();
+    const placeholderType = wantsUpper ? 'BOOLEAN' : 'boolean';
+
+    const properties = { ...(schema.properties || {}) };
+    if (!properties[CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER]) {
+        properties[CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER] = {
+            type: placeholderType,
+            description: 'Internal placeholder required by proxy; must be true.'
+        };
+    }
+
+    return {
+        ...schema,
+        type: schema.type || (wantsUpper ? 'OBJECT' : 'object'),
+        properties,
+        required: [CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER]
+    };
+}
+
+function injectClaudeToolRequiredArgPlaceholderIntoArgs(args) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
+    if (Object.prototype.hasOwnProperty.call(args, CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER)) return args;
+    return { ...args, [CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER]: CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER_VALUE };
+}
+
+function stripClaudeToolRequiredArgPlaceholderFromArgs(args) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
+    if (!Object.prototype.hasOwnProperty.call(args, CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER)) return args;
+    const { [CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER]: _ignored, ...rest } = args;
+    return rest;
+}
+
 function logThinkingDowngrade(payload) {
     try {
         const obj = payload && typeof payload === 'object' ? payload : {};
@@ -125,7 +338,7 @@ const CLAUDE_OPENAI_REPLAY_THOUGHT_TEXT = String(process.env.CLAUDE_OPENAI_REPLA
     .toLowerCase();
 const CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT = !['0', 'false', 'no', 'n', 'off'].includes(CLAUDE_OPENAI_REPLAY_THOUGHT_TEXT);
 const claudeToolThinkingCache = new Map(); // key: tool_call_id -> { signature, thoughtText, savedAt }
-const claudeToolThinkingBuffer = new Map(); // key: requestId -> { signature, thoughtText }
+const claudeToolThinkingBuffer = new Map(); // key: requestId -> { signature, thoughtText, pendingToolCallIds }
 
 // Claude extended thinking：按“用户会回放的 assistant 内容”缓存 signature，用于客户端不回放 thinking 块时的自动补齐
 const CLAUDE_ASSISTANT_SIGNATURE_TTL_MS = Number(process.env.CLAUDE_ASSISTANT_SIGNATURE_TTL_MS || 6 * 60 * 60 * 1000);
@@ -202,6 +415,9 @@ function cacheClaudeToolThinking(toolCallId, signature, thoughtText) {
         thoughtText: String(thoughtText || ''),
         savedAt: Date.now()
     });
+    // 兼容跨端点/重启：OpenAI 端点拿到的 signature 也写入通用 signature_cache，
+    // 这样后续即使切换到 Anthropic 端点（或容器重启）也能回放 tool_use 的 signature。
+    cacheClaudeThinkingSignature(key, String(signature));
     if (CLAUDE_THINKING_SIGNATURE_MAX > 0 && claudeToolThinkingCache.size > CLAUDE_THINKING_SIGNATURE_MAX) {
         const oldestKey = claudeToolThinkingCache.keys().next().value;
         if (oldestKey) claudeToolThinkingCache.delete(oldestKey);
@@ -212,7 +428,15 @@ function getCachedClaudeToolThinking(toolCallId) {
     if (!toolCallId) return null;
     const key = String(toolCallId);
     const entry = claudeToolThinkingCache.get(key);
-    if (!entry) return null;
+    if (!entry) {
+        // 兼容：如果该 tool_call_id 的 signature 来自 Anthropic 端点（已写入 signature_cache），这里也尝试恢复
+        const recovered = getCachedClaudeThinkingSignature(key);
+        if (recovered) {
+            cacheClaudeToolThinking(key, recovered, '');
+            return claudeToolThinkingCache.get(key) || null;
+        }
+        return null;
+    }
     if (CLAUDE_THINKING_SIGNATURE_TTL_MS > 0 && Date.now() - entry.savedAt > CLAUDE_THINKING_SIGNATURE_TTL_MS) {
         claudeToolThinkingCache.delete(key);
         return null;
@@ -376,6 +600,12 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     } = openaiRequest;
 
     const requestId = `agent-${uuidv4()}`;
+    const toolOutputLimiter = createToolOutputLimiter({
+        provider: 'openai',
+        route: '/v1/chat/completions',
+        model: model || null,
+        request_id: requestId
+    });
 
     // 提取 system 消息
     const systemMessages = messages.filter(m => m.role === 'system');
@@ -424,6 +654,28 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
             const cachedClaude = getCachedClaudeToolThinking(id);
             if (!cachedClaude?.signature) missingIds.push(id);
         }
+
+        // 容错：同一轮 assistant 可能发出多个 tool_calls，但 signature 实际上是“按回合/消息”共享的。
+        // 若只缺部分 id 的缓存，尝试从同一批 id 中任意一个已缓存的 signature 进行补齐，避免不必要的 thinking 降级。
+        if (missingIds.length > 0) {
+            let fallback = null;
+            let fallbackThoughtText = '';
+            for (const id of ids) {
+                const cachedClaude = getCachedClaudeToolThinking(id);
+                if (cachedClaude?.signature) {
+                    fallback = cachedClaude.signature;
+                    fallbackThoughtText = cachedClaude.thoughtText || '';
+                    break;
+                }
+            }
+            if (fallback) {
+                for (const id of missingIds) {
+                    cacheClaudeToolThinking(id, fallback, fallbackThoughtText);
+                }
+                missingIds.length = 0;
+            }
+        }
+
         if (missingIds.length > 0) {
             enableThinking = false;
             logThinkingDowngrade({
@@ -439,6 +691,23 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         }
     }
 
+    // Claude thinking：当工具 schema 没有 required 字段时，上游偶发不下发 tool_call（只输出 thinking 然后结束）
+    // 这里记录“需要注入内部 required 字段”的工具名集合，用于：
+    // - 请求侧：补齐 tool schema required
+    // - 回放历史：补齐 tool_call args required
+    const claudeToolsNeedingRequiredPlaceholder = new Set();
+    if (isClaudeModel && enableThinking && Array.isArray(tools)) {
+        for (const t of tools) {
+            const func = t?.function || t;
+            const name = func?.name;
+            if (!name) continue;
+            const params = func?.parameters;
+            if (needsClaudeToolRequiredArgPlaceholder(params)) {
+                claudeToolsNeedingRequiredPlaceholder.add(String(name));
+            }
+        }
+    }
+
     // 转换对话消息（排除 system），合并连续的工具结果
     for (let i = 0; i < nonSystemMessages.length; i++) {
         const msg = nonSystemMessages[i];
@@ -451,15 +720,28 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                 // 跨模型历史：如果当前是 Claude，但历史 tool_call_id 不是 Claude 风格（toolu_），则降级为纯文本上下文
                 if (isClaudeModel && toolMsg.tool_call_id && !looksLikeClaudeToolId(toolMsg.tool_call_id)) {
                     const name = toolMsg.name || 'unknown';
-                    const output = typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content);
+                    const output = limitToolOutput(toolMsg.content, toolOutputLimiter, {
+                        provider: 'openai',
+                        route: '/v1/chat/completions',
+                        model: model || null,
+                        tool_name: name,
+                        tool_call_id: toolMsg.tool_call_id
+                    });
                     toolParts.push({ text: `[tool:${name}] ${output}` });
                 } else {
+                    const output = limitToolOutput(toolMsg.content, toolOutputLimiter, {
+                        provider: 'openai',
+                        route: '/v1/chat/completions',
+                        model: model || null,
+                        tool_name: toolMsg.name || 'unknown',
+                        tool_call_id: toolMsg.tool_call_id
+                    });
                     toolParts.push({
                         functionResponse: {
                             id: toolMsg.tool_call_id,
                             name: toolMsg.name || 'unknown',
                             response: {
-                                output: typeof toolMsg.content === 'string' ? toolMsg.content : JSON.stringify(toolMsg.content)
+                                output
                             }
                         }
                     });
@@ -472,12 +754,47 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
             // 跨模型历史：如果当前是 Claude，但某条历史 assistant.tool_calls 不是 Claude 风格，直接跳过该条（保留 tool 结果文本即可）
             if (isClaudeModel && msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.some(tc => tc?.id && !looksLikeClaudeToolId(tc.id))) {
                 // 若有显式文本内容，仍保留为模型文本；否则跳过
-                if (msg.content) {
-                    contents.push({ role: 'model', parts: [{ text: msg.content }] });
+                const parts = [];
+                if (typeof msg.content === 'string' && msg.content) {
+                    parts.push({ text: msg.content });
+                } else if (Array.isArray(msg.content) && msg.content.length > 0) {
+                    for (const item of msg.content) {
+                        if (item?.type === 'text' && typeof item.text === 'string' && item.text) {
+                            parts.push({ text: item.text });
+                        }
+                    }
+                }
+
+                if (parts.length > 0) {
+                    contents.push({ role: 'model', parts });
                 }
                 continue;
             }
-            contents.push(convertMessage(msg, { isClaudeModel, enableThinking }));
+            contents.push(convertMessage(msg, { isClaudeModel, enableThinking, claudeToolsNeedingRequiredPlaceholder }));
+        }
+    }
+
+    // Claude（thinking）工具链路兼容：
+    // Antigravity/Claude 在“工具返回 -> 继续回答”的场景下，如果最后一条 user 内容只包含 functionResponse，
+    // 经常不会再下发任何 thought parts（即：没有可输出的 reasoning_content / thinking_delta）。
+    // 给 tool results 追加一个极短的 user 文本指令，可显著提高“工具后仍输出思维链”的稳定性。
+    if (isClaudeModel && enableThinking && contents.length > 0) {
+        const last = contents[contents.length - 1];
+        if (last?.role === 'user' && Array.isArray(last.parts) && last.parts.length > 0) {
+            const hasFunctionResponse = last.parts.some(p => p && typeof p === 'object' && p.functionResponse);
+            const hasNonEmptyText = last.parts.some(p => typeof p?.text === 'string' && p.text.trim() !== '');
+            const hasOnlyFunctionResponses =
+                hasFunctionResponse &&
+                last.parts.every(p => {
+                    if (!p || typeof p !== 'object') return false;
+                    if (p.functionResponse) return true;
+                    if (typeof p.text === 'string' && p.text.trim() === '') return true;
+                    return false;
+                });
+
+            if (hasOnlyFunctionResponses && !hasNonEmptyText) {
+                last.parts.push({ text: 'Continue.' });
+            }
         }
     }
 
@@ -490,6 +807,17 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         maxOutputTokens: max_tokens || 8192,
         candidateCount: 1
     };
+
+    // 工具链路下，限制过大的 max_tokens，避免挤压输入上下文导致 Prompt is too long
+    const shouldCapOutputTokens =
+        Number.isFinite(MAX_OUTPUT_TOKENS_WITH_TOOLS) &&
+        MAX_OUTPUT_TOKENS_WITH_TOOLS > 0 &&
+        (hasTools || hasToolCallsInHistory || hasToolResultsInHistory);
+    if (shouldCapOutputTokens && generationConfig.maxOutputTokens > MAX_OUTPUT_TOKENS_WITH_TOOLS) {
+        const minRequired = isClaudeModel && enableThinking ? (thinkingBudget * 2) : 0;
+        const effectiveCap = Math.max(MAX_OUTPUT_TOKENS_WITH_TOOLS, minRequired);
+        generationConfig.maxOutputTokens = Math.min(generationConfig.maxOutputTokens, effectiveCap);
+    }
 
     // Claude 模型不支持 topP
     if (!isClaudeModel && top_p !== undefined) {
@@ -543,7 +871,15 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 
     // 添加工具定义
     if (tools && tools.length > 0) {
-        request.request.tools = [{ functionDeclarations: tools.map(convertTool) }];
+        const declarations = tools.map(convertTool);
+        if (isClaudeModel && enableThinking && claudeToolsNeedingRequiredPlaceholder.size > 0) {
+            for (const d of declarations) {
+                if (d && typeof d === 'object' && d.name && claudeToolsNeedingRequiredPlaceholder.has(d.name)) {
+                    d.parameters = injectClaudeToolRequiredArgPlaceholderIntoSchema(d.parameters);
+                }
+            }
+        }
+        request.request.tools = [{ functionDeclarations: declarations }];
         request.request.toolConfig = {
             functionCallingConfig: {
                 mode: tool_choice === 'none' ? 'NONE' :
@@ -559,7 +895,11 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
  * 转换单条消息
  */
 function convertMessage(msg, ctx = {}) {
-    const { isClaudeModel = false, enableThinking = false } = ctx;
+    const {
+        isClaudeModel = false,
+        enableThinking = false,
+        claudeToolsNeedingRequiredPlaceholder = null
+    } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
     // 处理工具调用结果
@@ -589,32 +929,73 @@ function convertMessage(msg, ctx = {}) {
             const firstToolCallId = msg.tool_calls?.[0]?.id;
             const replayClaude = firstToolCallId ? getCachedClaudeToolThinking(firstToolCallId) : null;
             if (replayClaude?.signature) {
+                // 上游（Claude extended thinking）在回放历史时要求 thinking.thinking 字段存在；
+                // 但 OpenAI 协议不携带思维链文本，且我们可能选择不回放 thoughtText。
+                // 空字符串在部分中间层会被视为“未设置”，从而触发：
+                //   messages.N.content.0.thinking.thinking: Field required
+                // 因此当我们仅回放 signature（或 thoughtText 为空）时，用一个空格占位即可（无语义）。
+                let replayText = CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT ? (replayClaude.thoughtText || '') : '';
+                if (typeof replayText !== 'string') replayText = '';
+                if (replayText === '') replayText = ' ';
                 parts.push({
                     thought: true,
-                    text: CLAUDE_OPENAI_REPLAY_INCLUDE_TEXT ? (replayClaude.thoughtText || '') : '',
+                    text: replayText,
                     thoughtSignature: replayClaude.signature
                 });
             }
         }
 
         // 如果有文本内容（必须在 thinking 之后，避免 Claude tool_use 校验失败）
-        if (msg.content) {
+        // 兼容：部分客户端在 tool_calls 消息里会把 content 设成 []（而不是 "" / null），直接透传会导致上游报错（text 字段收到 list）
+        if (typeof msg.content === 'string' && msg.content) {
             parts.push({ text: msg.content });
+        } else if (Array.isArray(msg.content) && msg.content.length > 0) {
+            for (const item of msg.content) {
+                if (item?.type === 'text' && typeof item.text === 'string' && item.text) {
+                    parts.push({ text: item.text });
+                }
+                if (item?.type === 'image_url' && item.image_url?.url) {
+                    const parsed = parseDataUrl(item.image_url.url);
+                    if (parsed) {
+                        parts.push({
+                            inlineData: {
+                                mimeType: parsed.mimeType,
+                                data: parsed.data
+                            }
+                        });
+                    }
+                }
+            }
         }
 
-        // 添加工具调用
-        for (const toolCall of msg.tool_calls) {
-            const toolCallId = toolCall.id || `call_${uuidv4().slice(0, 8)}`;
-            const thoughtSignature = getCachedToolThoughtSignature(toolCallId);
-            parts.push({
-                ...(thoughtSignature ? { thoughtSignature } : {}),
-                functionCall: {
-                    id: toolCallId,
-                    name: toolCall.function.name,
-                    args: JSON.parse(toolCall.function.arguments || '{}')
+	        // 添加工具调用
+	        for (const toolCall of msg.tool_calls) {
+	            const toolCallId = toolCall.id || `call_${uuidv4().slice(0, 8)}`;
+	            const thoughtSignature = getCachedToolThoughtSignature(toolCallId);
+                let args = {};
+                try {
+                    args = JSON.parse(toolCall.function.arguments || '{}');
+                } catch {
+                    args = {};
                 }
-            });
-        }
+                if (
+                    isClaudeModel &&
+                    enableThinking &&
+                    claudeToolsNeedingRequiredPlaceholder &&
+                    toolCall?.function?.name &&
+                    claudeToolsNeedingRequiredPlaceholder.has(toolCall.function.name)
+                ) {
+                    args = injectClaudeToolRequiredArgPlaceholderIntoArgs(args || {});
+                }
+	            parts.push({
+	                ...(thoughtSignature ? { thoughtSignature } : {}),
+	                functionCall: {
+	                    id: toolCallId,
+	                    name: toolCall.function.name,
+	                    args
+	                }
+	            });
+	        }
 
         return { role: 'model', parts };
     }
@@ -761,17 +1142,40 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
         const chunks = [];
         const stateKey = requestId;
         const isClaudeModel = String(model || '').includes('claude');
-        const claudeBuf = claudeToolThinkingBuffer.get(stateKey) || { signature: null, thoughtText: '' };
+        const claudeBuf = claudeToolThinkingBuffer.get(stateKey) || { signature: null, thoughtText: '', pendingToolCallIds: [] };
+        if (!Array.isArray(claudeBuf.pendingToolCallIds)) claudeBuf.pendingToolCallIds = [];
         const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+
+        const flushClaudePendingToolCalls = () => {
+            if (!isClaudeModel) return;
+            const signature = claudeBuf.signature;
+            if (!signature) return;
+            const pending = claudeBuf.pendingToolCallIds;
+            if (!Array.isArray(pending) || pending.length === 0) return;
+            for (const id of pending) {
+                cacheClaudeToolThinking(id, signature, claudeBuf.thoughtText);
+            }
+            claudeBuf.pendingToolCallIds = [];
+        };
+
+        // 兜底：有些上游会把 signature 放在 candidate 级别或 response 级别，而不是 thought part 上
+        if (isClaudeModel) {
+            const preSig = extractThoughtSignatureFromCandidate(candidate, data);
+            if (preSig && !claudeBuf.signature) {
+                claudeBuf.signature = preSig;
+            }
+            flushClaudePendingToolCalls();
+        }
 
         for (const part of parts) {
             // 处理思维链内容
             if (part.thought) {
                 if (isClaudeModel) {
-                    const sig = part.thoughtSignature || part.thought_signature;
+                    const sig = extractThoughtSignatureFromPart(part);
                     if (sig) claudeBuf.signature = sig;
                     if (part.text) claudeBuf.thoughtText += part.text;
                     claudeToolThinkingBuffer.set(stateKey, claudeBuf);
+                    flushClaudePendingToolCalls();
                 }
                 if (!includeThinking) continue;
 
@@ -840,16 +1244,25 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
             }
 
             // 处理工具调用
-            if (part.functionCall) {
-                const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
-                const sig = extractThoughtSignatureFromPart(part);
-                if (sig) {
-                    cacheToolThoughtSignature(callId, sig);
-                }
+	            if (part.functionCall) {
+	                const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
+                    const cleanedArgs = stripClaudeToolRequiredArgPlaceholderFromArgs(part.functionCall.args || {});
+	                const sig = extractThoughtSignatureFromPart(part);
+	                if (sig) {
+	                    cacheToolThoughtSignature(callId, sig);
+	                }
                 if (isClaudeModel) {
                     const signature = claudeBuf.signature || sig;
                     if (signature) {
+                        if (!claudeBuf.signature) claudeBuf.signature = signature;
                         cacheClaudeToolThinking(callId, signature, claudeBuf.thoughtText);
+                        // 如果之前有 pending 的 tool_call_id，现在也一并补齐
+                        flushClaudePendingToolCalls();
+                    } else {
+                        // signature 可能在后续 chunk/part 才出现（例如多个 tool_calls 连发后再下发 thinking/signature）
+                        // 先记录下来，等拿到 signature 后再补齐缓存，避免下一轮降级 thinking。
+                        claudeBuf.pendingToolCallIds.push(callId);
+                        claudeToolThinkingBuffer.set(stateKey, claudeBuf);
                     }
                 }
                 chunks.push({
@@ -864,14 +1277,14 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
                                 index: 0,
                                 id: callId,
                                 type: 'function',
-                                function: {
-                                    name: part.functionCall.name,
-                                    arguments: JSON.stringify(part.functionCall.args || {})
-                                }
-                            }]
-                        },
-                        finish_reason: null
-                    }]
+	                                function: {
+	                                    name: part.functionCall.name,
+	                                    arguments: JSON.stringify(cleanedArgs || {})
+	                                }
+	                            }]
+	                        },
+	                        finish_reason: null
+	                    }]
                 });
                 continue;
             }
@@ -914,7 +1327,8 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
         }
 
         // 处理结束标志
-	        if (candidate.finishReason === 'STOP' || candidate.finishReason === 'MAX_TOKENS') {
+		        if (candidate.finishReason === 'STOP' || candidate.finishReason === 'MAX_TOKENS') {
+            flushClaudePendingToolCalls();
             claudeToolThinkingBuffer.delete(stateKey);
             // 如果还在思维链中，先关闭标签
             if (OPENAI_THINKING_INCLUDE_TAGS && thinkingState.get(stateKey)) {
@@ -979,7 +1393,9 @@ export function convertResponse(antigravityResponse, requestId, model, includeTh
         const toolCalls = [];
         const isClaudeModel = String(model || '').includes('claude');
         let claudeThoughtText = '';
-        let claudeSignature = null;
+        let claudeSignature = extractThoughtSignatureFromCandidate(candidate, data);
+        const claudeToolCallIds = [];
+        const claudeSignatureByToolCallId = new Map();
 
         for (const part of parts) {
             // 处理思维链
@@ -987,7 +1403,7 @@ export function convertResponse(antigravityResponse, requestId, model, includeTh
                 const thoughtText = part.text ?? '';
                 if (isClaudeModel) {
                     if (thoughtText) claudeThoughtText += thoughtText;
-                    const sig = part.thoughtSignature || part.thought_signature;
+                    const sig = extractThoughtSignatureFromPart(part);
                     if (sig) claudeSignature = sig;
                 }
                 if (!includeThinking) continue;
@@ -1005,31 +1421,44 @@ export function convertResponse(antigravityResponse, requestId, model, includeTh
                 content += part.text;
             }
 
-            if (part.functionCall) {
-                const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
-                const sig = part.thoughtSignature || part.thought_signature;
-                if (sig) {
-                    cacheToolThoughtSignature(callId, sig);
-                }
+	            if (part.functionCall) {
+	                const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
+                    const cleanedArgs = stripClaudeToolRequiredArgPlaceholderFromArgs(part.functionCall.args || {});
+	                const sig = extractThoughtSignatureFromPart(part);
+	                if (sig) {
+	                    cacheToolThoughtSignature(callId, sig);
+	                }
                 if (isClaudeModel) {
-                    const signature = claudeSignature || sig;
-                    if (signature) {
-                        cacheClaudeToolThinking(callId, signature, claudeThoughtText);
+                    if (sig) {
+                        claudeSignatureByToolCallId.set(callId, sig);
+                        if (!claudeSignature) claudeSignature = sig;
                     }
+                    claudeToolCallIds.push(callId);
                 }
-                toolCalls.push({
-                    id: callId,
-                    type: 'function',
-                    function: {
-                        name: part.functionCall.name,
-                        arguments: JSON.stringify(part.functionCall.args || {})
-                    }
-                });
-            }
+	                toolCalls.push({
+	                    id: callId,
+	                    type: 'function',
+	                    function: {
+	                        name: part.functionCall.name,
+	                        arguments: JSON.stringify(cleanedArgs || {})
+	                    }
+	                });
+	            }
 
             if (part.inlineData) {
                 const dataUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
                 content += `![image](${dataUrl})`;
+            }
+        }
+
+        // OpenAI 端点（Claude）：有些上游会在 functionCall 之后才下发 thought/signature。
+        // 为避免“多 tool_calls 连发时丢 signature -> 下一轮 thinking 被降级”，这里在解析完全部 parts 后再统一缓存。
+        if (isClaudeModel && claudeToolCallIds.length > 0) {
+            for (const id of claudeToolCallIds) {
+                const sig = claudeSignatureByToolCallId.get(id) || claudeSignature;
+                if (sig) {
+                    cacheClaudeToolThinking(id, sig, claudeThoughtText);
+                }
             }
         }
 
@@ -1125,6 +1554,12 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         thinking
     } = anthropicRequest;
 
+    const toolOutputLimiter = createToolOutputLimiter({
+        provider: 'anthropic',
+        route: '/v1/messages',
+        model: model || null
+    });
+
     // 检测 thinking 模式 - 显式启用或根据模型名自动启用
     // 如果明确设置了 thinking.type，使用该设置；否则根据模型名判断
     const thinkingEnabled = thinking?.type === 'enabled' ||
@@ -1134,6 +1569,19 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
     // 获取实际模型名称
     const actualModel = getMappedModel(model);
     const isClaudeModel = model.includes('claude');
+
+    // Claude thinking：当工具 schema 没有 required 字段时，上游偶发不下发 tool_use/tool_call（只输出 thinking 然后结束）
+    const claudeToolsNeedingRequiredPlaceholder = new Set();
+    if (isClaudeModel && thinkingEnabled && Array.isArray(tools)) {
+        for (const t of tools) {
+            const name = t?.name;
+            if (!name) continue;
+            const schema = t?.input_schema;
+            if (needsClaudeToolRequiredArgPlaceholder(schema)) {
+                claudeToolsNeedingRequiredPlaceholder.add(String(name));
+            }
+        }
+    }
 
     // 转换消息
     const contents = [];
@@ -1158,27 +1606,78 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         if (msg.role === 'user' && Array.isArray(msg.content)) {
             const toolResults = msg.content.filter(c => c.type === 'tool_result');
             if (toolResults.length > 0) {
-                const parts = toolResults.map(tr => ({
-                    functionResponse: {
-                        id: tr.tool_use_id,
-                        name: tr.name || toolUseNameById.get(tr.tool_use_id) || 'unknown',
-                        response: {
-                            output: typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content)
+                const parts = toolResults.map(tr => {
+                    const toolName = tr.name || toolUseNameById.get(tr.tool_use_id) || 'unknown';
+                    const output = limitToolOutput(tr.content, toolOutputLimiter, {
+                        provider: 'anthropic',
+                        route: '/v1/messages',
+                        model: model || null,
+                        tool_name: toolName,
+                        tool_use_id: tr.tool_use_id
+                    });
+                    return {
+                        functionResponse: {
+                            id: tr.tool_use_id,
+                            name: toolName,
+                            response: { output }
                         }
-                    }
-                }));
+                    };
+                });
                 contents.push({ role: 'user', parts });
                 continue;
             }
         }
 
-        contents.push(convertAnthropicMessage(msg, thinkingEnabled));
+        contents.push(convertAnthropicMessage(msg, thinkingEnabled, { isClaudeModel, thinkingEnabled, claudeToolsNeedingRequiredPlaceholder }));
+    }
+
+    // Claude（thinking）工具链路兼容：
+    // 与 OpenAI 端点同理：当最后一条 user 消息只包含 tool_result（转换后为 functionResponse）时，
+    // 上游经常不再输出 thought parts，导致客户端只能看到“空 thinking 块”。
+    // 给最后一条 user message 追加一个极短文本，提升“工具后仍输出思维链”的稳定性。
+    if (isClaudeModel && thinkingEnabled && contents.length > 0) {
+        const last = contents[contents.length - 1];
+        if (last?.role === 'user' && Array.isArray(last.parts) && last.parts.length > 0) {
+            const hasFunctionResponse = last.parts.some(p => p && typeof p === 'object' && p.functionResponse);
+            const hasNonEmptyText = last.parts.some(p => typeof p?.text === 'string' && p.text.trim() !== '');
+            const hasOnlyFunctionResponses =
+                hasFunctionResponse &&
+                last.parts.every(p => {
+                    if (!p || typeof p !== 'object') return false;
+                    if (p.functionResponse) return true;
+                    if (typeof p.text === 'string' && p.text.trim() === '') return true;
+                    return false;
+                });
+
+            if (hasOnlyFunctionResponses && !hasNonEmptyText) {
+                last.parts.push({ text: 'Continue.' });
+            }
+        }
     }
 
     // 构建 generationConfig
+    let maxOutputTokens = max_tokens || 8192;
+    const hasToolsInRequest = Array.isArray(tools) && tools.length > 0;
+    const hasToolResultsInHistory =
+        Array.isArray(messages) &&
+        messages.some(m =>
+            m?.role === 'user' &&
+            Array.isArray(m.content) &&
+            m.content.some(b => b && b.type === 'tool_result')
+        );
+    const shouldCapOutputTokens =
+        Number.isFinite(MAX_OUTPUT_TOKENS_WITH_TOOLS) &&
+        MAX_OUTPUT_TOKENS_WITH_TOOLS > 0 &&
+        (hasToolsInRequest || hasToolResultsInHistory);
+    if (shouldCapOutputTokens && maxOutputTokens > MAX_OUTPUT_TOKENS_WITH_TOOLS) {
+        const minRequired = isClaudeModel && thinkingEnabled ? (thinkingBudget * 2) : 0;
+        const effectiveCap = Math.max(MAX_OUTPUT_TOKENS_WITH_TOOLS, minRequired);
+        maxOutputTokens = Math.min(maxOutputTokens, effectiveCap);
+    }
+
     const generationConfig = {
         temperature: temperature ?? DEFAULT_TEMPERATURE,
-        maxOutputTokens: max_tokens || 8192,
+        maxOutputTokens,
         candidateCount: 1
     };
 
@@ -1244,8 +1743,16 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
             .map(t => normalizeAnthropicTool(t, isClaudeModel))
             .filter(Boolean);
 
-        if (normalizedTools.length > 0) {
-            request.request.tools = [{ functionDeclarations: normalizedTools.map(t => convertAnthropicTool(t, isClaudeModel)) }];
+	        if (normalizedTools.length > 0) {
+	            const declarations = normalizedTools.map(t => convertAnthropicTool(t, isClaudeModel));
+                if (isClaudeModel && thinkingEnabled && claudeToolsNeedingRequiredPlaceholder.size > 0) {
+                    for (const d of declarations) {
+                        if (d && typeof d === 'object' && d.name && claudeToolsNeedingRequiredPlaceholder.has(d.name)) {
+                            d.parameters = injectClaudeToolRequiredArgPlaceholderIntoSchema(d.parameters);
+                        }
+                    }
+                }
+	            request.request.tools = [{ functionDeclarations: declarations }];
 
             let toolMode = 'AUTO';
             if (tool_choice) {
@@ -1384,7 +1891,8 @@ function getBuiltinAnthropicToolSchema(name) {
 /**
  * 转换 Anthropic 格式的单条消息
  */
-function convertAnthropicMessage(msg, thinkingEnabled = false) {
+function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
+    const { isClaudeModel = false, claudeToolsNeedingRequiredPlaceholder = null } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
     // 简单文本消息
@@ -1448,11 +1956,21 @@ function convertAnthropicMessage(msg, thinkingEnabled = false) {
 
             // 处理工具调用 - 放到单独的数组，最后添加
             if (item.type === 'tool_use') {
+                let args = item.input || {};
+                if (
+                    isClaudeModel &&
+                    thinkingEnabled &&
+                    claudeToolsNeedingRequiredPlaceholder &&
+                    item?.name &&
+                    claudeToolsNeedingRequiredPlaceholder.has(item.name)
+                ) {
+                    args = injectClaudeToolRequiredArgPlaceholderIntoArgs(args || {});
+                }
                 functionCallParts.push({
                     functionCall: {
                         id: item.id,
                         name: item.name,
-                        args: item.input || {}
+                        args
                     }
                 });
                 continue;
@@ -1562,16 +2080,17 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
                 content.push({ type: 'text', text: part.text });
             }
 
-            if (part.functionCall) {
-                const toolUseId = part.functionCall.id || `toolu_${uuidv4().slice(0, 8)}`;
-                toolUseIds.push(toolUseId);
-                content.push({
-                    type: 'tool_use',
-                    id: toolUseId,
-                    name: part.functionCall.name,
-                    input: part.functionCall.args || {}
-                });
-            }
+	            if (part.functionCall) {
+	                const toolUseId = part.functionCall.id || `toolu_${uuidv4().slice(0, 8)}`;
+                    const cleanedArgs = stripClaudeToolRequiredArgPlaceholderFromArgs(part.functionCall.args || {});
+	                toolUseIds.push(toolUseId);
+	                content.push({
+	                    type: 'tool_use',
+	                    id: toolUseId,
+	                    name: part.functionCall.name,
+	                    input: cleanedArgs || {}
+	                });
+	            }
 
             if (part.inlineData) {
                 content.push({
@@ -1594,16 +2113,13 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
         }
 
         if (thinkingEnabled && (thinkingText || messageThinkingSignature)) {
-            // 没有 thinking 文本时不要伪造（可能导致 signature 校验不一致），用 redacted_thinking
-            if (!thinkingText && messageThinkingSignature) {
-                content.unshift({ type: 'redacted_thinking', signature: messageThinkingSignature });
-            } else {
-                content.unshift({
-                    type: 'thinking',
-                    thinking: thinkingText || '',
-                    ...(messageThinkingSignature ? { signature: messageThinkingSignature } : {})
-                });
-            }
+            // 兼容：部分客户端还不支持 redacted_thinking（会直接报错/中断工具链路）。
+            // 这里始终输出 thinking 块；当 thinking 为空且存在 signature 时，后续请求回放阶段会在 preprocess 中转换为 redacted_thinking 再发往上游。
+            content.unshift({
+                type: 'thinking',
+                thinking: thinkingText || '',
+                ...(messageThinkingSignature ? { signature: messageThinkingSignature } : {})
+            });
         }
 
         // 更新 last-signature（用于后续 signature 缺失的回合兜底）
@@ -1675,6 +2191,7 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
             }
 	        if (!Array.isArray(newState.pendingToolUseIds)) newState.pendingToolUseIds = [];
             if (!('thinkingStopped' in newState)) newState.thinkingStopped = false;
+            if (!('completed' in newState)) newState.completed = false;
 
             const thinkingEnabledForResponse =
                 newState.thinkingEnabled === null || newState.thinkingEnabled === undefined
@@ -1708,19 +2225,11 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                 if (newState.hasThinking) return;
 
                 const sig = newState.lastThinkingSignature || newState.lastUserThinkingSignature || null;
-                if (sig) {
-                    events.push({
-                        type: 'content_block_start',
-                        index: 0,
-                        content_block: { type: 'redacted_thinking', signature: sig }
-                    });
-                } else {
-                    events.push({
-                        type: 'content_block_start',
-                        index: 0,
-                        content_block: { type: 'thinking', thinking: '' }
-                    });
-                }
+                events.push({
+                    type: 'content_block_start',
+                    index: 0,
+                    content_block: { type: 'thinking', thinking: '', ...(sig ? { signature: sig } : {}) }
+                });
                 events.push({ type: 'content_block_stop', index: 0 });
 
                 newState.hasThinking = true;
@@ -1865,14 +2374,14 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
 	                    }
 	                });
 
-                events.push({
-                    type: 'content_block_delta',
-                    index: toolIndex,
-                    delta: {
-                        type: 'input_json_delta',
-                        partial_json: JSON.stringify(part.functionCall.args || {})
-                    }
-                });
+	                events.push({
+	                    type: 'content_block_delta',
+	                    index: toolIndex,
+	                    delta: {
+	                        type: 'input_json_delta',
+	                        partial_json: JSON.stringify(stripClaudeToolRequiredArgPlaceholderFromArgs(part.functionCall.args || {}) || {})
+	                    }
+	                });
 
                 events.push({
                     type: 'content_block_stop',
@@ -1881,8 +2390,15 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
             }
         }
 
-        // 处理结束
-        if (candidate.finishReason === 'STOP' || candidate.finishReason === 'MAX_TOKENS') {
+        // 处理结束：不同上游的 finishReason 取值可能不同（例如 STOP / MAX_TOKENS / SAFETY / OTHER ...）
+        const finishReasonRaw = candidate.finishReason ?? candidate.finish_reason ?? null;
+        const finishReason = typeof finishReasonRaw === 'string' ? finishReasonRaw.toUpperCase() : '';
+        const isFinalFinish =
+            !!finishReason &&
+            finishReason !== 'FINISH_REASON_UNSPECIFIED' &&
+            finishReason !== 'UNSPECIFIED';
+
+        if (isFinalFinish) {
             // 关闭所有打开的块
             if (newState.inThinking) {
                 events.push({
@@ -1890,19 +2406,26 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                     index: 0
                 });
                 newState.thinkingStopped = true;
+                newState.inThinking = false;
             }
             if (newState.inText) {
                 events.push({
                     type: 'content_block_stop',
                     index: newState.textIndex
                 });
+                newState.inText = false;
             }
 
             // 发送 message_delta - 根据是否有工具调用决定 stop_reason
+            let stopReason = 'end_turn';
+            if (newState.hasToolUse) stopReason = 'tool_use';
+            else if (finishReason === 'MAX_TOKENS') stopReason = 'max_tokens';
+            else if (finishReason === 'STOP_SEQUENCE') stopReason = 'stop_sequence';
+
             events.push({
                 type: 'message_delta',
                 delta: {
-                    stop_reason: newState.hasToolUse ? 'tool_use' : 'end_turn',
+                    stop_reason: stopReason,
                     stop_sequence: null
                 },
                 usage: {
@@ -1911,6 +2434,7 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
             });
 
 	            events.push({ type: 'message_stop' });
+                newState.completed = true;
 	        }
 
 	        return { events, state: newState };
@@ -1930,12 +2454,41 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
  * 以避免上游直接报错。
  */
 export function preprocessAnthropicRequest(request) {
+    if (!request?.messages) return request;
+
+    // 预清洗：移除空 text 块（部分上游会把 text:"" 当作“未设置”，从而报 Field required）
+    // 典型复现：OpenAI 端点 tool_calls 的 assistant.content 为 ""/[]，客户端换用 Anthropic 端点回放时会生成 {type:"text",text:""}。
+    let didMutate = false;
+    const sanitizedMessages = request.messages.map((msg) => {
+        if (!msg || !Array.isArray(msg.content)) return msg;
+
+        const filtered = [];
+        for (const block of msg.content) {
+            if (!block || typeof block !== 'object') continue;
+            if (block.type === 'text') {
+                if (typeof block.text !== 'string' || block.text === '') {
+                    didMutate = true;
+                    continue;
+                }
+            }
+            filtered.push(block);
+        }
+
+        // 避免空 content：用无语义空格占位（不会触发 Field required）
+        if (filtered.length === 0) {
+            didMutate = true;
+            filtered.push({ type: 'text', text: ' ' });
+        }
+
+        return { ...msg, content: filtered };
+    });
+
     // 检测 thinking 模式 - 显式启用或根据模型名自动启用
     const thinkingEnabled = request.thinking?.type === 'enabled' ||
         (request.thinking?.type !== 'disabled' && isThinkingModel(request.model));
 
-    if (!thinkingEnabled || !request.messages) {
-        return request;
+    if (!thinkingEnabled) {
+        return didMutate ? { ...request, messages: sanitizedMessages } : request;
     }
 
     const extractSystemText = (sys) => {
@@ -1968,10 +2521,9 @@ export function preprocessAnthropicRequest(request) {
     // 3) 仅当“包含 tool_use 的历史消息”无法恢复 signature 时，才降级禁用 thinking（避免上游报错）。
 
     let mustDisableThinking = false;
-    let didMutate = false;
     const missingToolUseIdsForSignature = [];
 
-    let workingMessages = request.messages;
+    let workingMessages = sanitizedMessages;
     let workingSystem = request.system;
 
     // Claude Code（以及类似“用 assistant '{' 作为 JSON 前缀”的调用）兼容：
@@ -2139,7 +2691,7 @@ export function preprocessAnthropicRequest(request) {
                 const filtered = blocks.filter(b =>
                     !(b && (b.type === 'thinking' || b.type === 'redacted_thinking') && !b.signature)
                 );
-                if (filtered.length === 0) filtered.push({ type: 'text', text: '' });
+                if (filtered.length === 0) filtered.push({ type: 'text', text: ' ' });
                 didMutate = true;
                 return { ...msg, content: filtered };
             }
@@ -2175,7 +2727,7 @@ export function preprocessAnthropicRequest(request) {
         const filteredContent = msg.content.filter(block =>
             block.type !== 'thinking' && block.type !== 'redacted_thinking'
         );
-        if (filteredContent.length === 0) filteredContent.push({ type: 'text', text: '' });
+        if (filteredContent.length === 0) filteredContent.push({ type: 'text', text: ' ' });
         return { ...msg, content: filteredContent };
     });
 

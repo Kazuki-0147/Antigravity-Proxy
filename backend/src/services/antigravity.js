@@ -47,10 +47,46 @@ export async function streamChat(account, request, onData, onError, signal = nul
             throw err;
         }
 
-        // 处理 SSE 流
+        // 处理 SSE 流（按 SSE 事件边界聚合 data 行，兼容多行 data / data: 前缀无空格）
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+        let eventDataLines = [];
+
+        const handleData = (data) => {
+            const payload = String(data ?? '').trim();
+            if (!payload || payload === '[DONE]') return;
+
+            // 上游可能在 SSE 中返回结构化错误/安全拦截信息（HTTP 200 但无 candidates）
+            // 这种情况下，如果我们不处理，客户端会看到“空回复且不报错”
+            try {
+                const parsed = JSON.parse(payload);
+                const upstreamError = parsed?.error;
+                const promptFeedback = parsed?.response?.promptFeedback;
+                const blockReason = promptFeedback?.blockReason || promptFeedback?.blockReasonMessage;
+
+                if (upstreamError?.message) {
+                    throw new Error(upstreamError.message);
+                }
+                if (blockReason) {
+                    throw new Error(`Upstream blocked request: ${blockReason}`);
+                }
+            } catch (e) {
+                // JSON.parse 失败：忽略（走 onData）
+                // JSON.parse 成功但 throw：会被外层 catch 捕获并走 onError
+                if (e instanceof SyntaxError) {
+                    // ignore
+                } else if (e instanceof Error) {
+                    throw e;
+                }
+            }
+
+            try {
+                onData(payload);
+            } catch {
+                // ignore
+            }
+        };
 
         while (true) {
             const { done, value } = await reader.read();
@@ -65,49 +101,33 @@ export async function streamChat(account, request, onData, onError, signal = nul
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
 
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6).trim();
-                    if (data && data !== '[DONE]') {
-                        // 上游可能在 SSE 中返回结构化错误/安全拦截信息（HTTP 200 但无 candidates）
-                        // 这种情况下，如果我们不处理，客户端会看到“空回复且不报错”
-                        try {
-                            const parsed = JSON.parse(data);
-                            const upstreamError = parsed?.error;
-                            const promptFeedback = parsed?.response?.promptFeedback;
-                            const blockReason = promptFeedback?.blockReason || promptFeedback?.blockReasonMessage;
+            for (let line of lines) {
+                if (line.endsWith('\r')) line = line.slice(0, -1);
 
-                            if (upstreamError?.message) {
-                                throw new Error(upstreamError.message);
-                            }
-                            if (blockReason) {
-                                throw new Error(`Upstream blocked request: ${blockReason}`);
-                            }
-                        } catch (e) {
-                            // JSON.parse 失败：忽略（走 onData）
-                            // JSON.parse 成功但 throw：会被外层 catch 捕获并走 onError
-                            if (e instanceof SyntaxError) {
-                                // ignore
-                            } else if (e instanceof Error) {
-                                throw e;
-                            }
-                        }
-                        try {
-                            onData(data);
-                        } catch {
-                            // ignore
-                        }
+                // 空行表示一个 SSE event 结束
+                if (line === '') {
+                    if (eventDataLines.length > 0) {
+                        handleData(eventDataLines.join('\n'));
+                        eventDataLines = [];
                     }
+                    continue;
+                }
+
+                if (line.startsWith('data:')) {
+                    eventDataLines.push(line.slice(5).trimStart());
                 }
             }
         }
 
-        // 处理剩余的 buffer
-        if (buffer.startsWith('data: ')) {
-            const data = buffer.slice(6).trim();
-            if (data && data !== '[DONE]') {
-                onData(data);
+        // 处理剩余的 buffer（以及最后一个未被空行终止的 event）
+        if (buffer) {
+            const lastLine = buffer.endsWith('\r') ? buffer.slice(0, -1) : buffer;
+            if (lastLine.startsWith('data:')) {
+                eventDataLines.push(lastLine.slice(5).trimStart());
             }
+        }
+        if (eventDataLines.length > 0) {
+            handleData(eventDataLines.join('\n'));
         }
     } catch (error) {
         if (error.name === 'AbortError') {

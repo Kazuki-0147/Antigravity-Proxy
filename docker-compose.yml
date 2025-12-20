@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   app:
     build: .
@@ -20,6 +18,10 @@ services:
       - CAPACITY_COOLDOWN_MAX_MS=${CAPACITY_COOLDOWN_MAX_MS:-120000}
       # 仪表盘「今日」统计时区（分钟），中国时间为 480
       - DASHBOARD_TZ_OFFSET_MINUTES=${DASHBOARD_TZ_OFFSET_MINUTES:-480}
+      # 关闭：tool_result 截断 / 工具链路 max_tokens 限制（需要时可自行开启）
+      - TOOL_RESULT_MAX_CHARS=${TOOL_RESULT_MAX_CHARS:-0}
+      - TOOL_RESULT_TOTAL_MAX_CHARS=${TOOL_RESULT_TOTAL_MAX_CHARS:-0}
+      - MAX_OUTPUT_TOKENS_WITH_TOOLS=${MAX_OUTPUT_TOKENS_WITH_TOOLS:-0}
       # 容器内必须监听 0.0.0.0 才能被宿主机端口映射访问
       - HOST=0.0.0.0
       - PORT=3000
