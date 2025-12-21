@@ -29,13 +29,6 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-3) 访问：
-
-- 管理面板：`http://127.0.0.1:${PORT:-8088}`
-- API Base：`http://127.0.0.1:${PORT:-8088}/v1`
-- Gemini Base：`http://127.0.0.1:${PORT:-8088}/v1beta`
-- 健康检查：`http://127.0.0.1:${PORT:-8088}/health`
-
 > Docker 默认会把数据库持久化到 `./data/database.sqlite`（见 `docker-compose.yml` 的 volume）。
 
 ### 方式 B：本地（开发/快速试用）
