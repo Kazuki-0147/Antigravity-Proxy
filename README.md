@@ -59,11 +59,7 @@ npm start
 - **OAuth 绑定**：`OAuth` → 浏览器授权 → 复制回调 URL 粘贴回面板 → 完成添加
 - **手动添加**：填 `email` + `refresh_token`
 
-建议完成后点一次 **刷新 Token/配额**（同步 tier/projectId/quota）。
-
-3) 创建 API Key（API Keys）：
-- OpenAI 风格：`Authorization: Bearer sk-...`
-- Anthropic 风格：`x-api-key: sk-...`
+3) 创建 API Key（API Keys）
 
 ## API 使用
 
@@ -235,16 +231,6 @@ Anthropic extended thinking 对包含 `tool_use` 的历史消息有强校验：�
 补充说明：
 - Anthropic 端点的签名缓存会写入 SQLite（`signature_cache` 表），避免容器重启丢失；但仍受 TTL 控制（默认 24h）。
 - OpenAI 端点的签名回放缓存是代理进程内存 Map，容器重启会清空；同时也受 TTL 控制。
-
-### 2) Claude Code 原生 Web Search
-
-Claude Code 在 Anthropic 端点下会用 `web_search_*`（带日期版本后缀）作为“服务器工具”。官方 Anthropic 会在服务器侧执行搜索并返回 `server_tool_use` + `web_search_tool_result`。
-
-本项目的处理：
-- 对 Claude Code 的“web search helper call”请求，代理会在服务端执行搜索并返回等价的 `server_tool_use/web_search_tool_result`（避免出现 `Did 0 searches`）。
-- 对“web_search 工具返回空结果”的场景，代理会在请求侧兜底补全（把空 `tool_result` 替换为真实搜索结果）。
-
-搜索源（best-effort）：Google News RSS、DuckDuckGo Instant Answer、Wikipedia（见 `backend/src/services/webSearch.js`）。
 
 ## 支持模型（`/v1/models` 返回）
 
