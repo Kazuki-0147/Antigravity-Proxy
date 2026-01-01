@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { getMappedModel, isThinkingModel } from '../../config.js';
 
-import { CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER, injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
+import { CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER, injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, shouldInjectClaudeToolResultPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
 import { convertJsonSchema, generateSessionId } from './schema-converter.js';
 import { cacheClaudeAssistantSignature, cacheClaudeLastThinkingSignature, cacheClaudeThinkingSignature, getCachedClaudeAssistantSignature, getCachedClaudeLastThinkingSignature, getCachedClaudeThinkingSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
@@ -48,8 +48,14 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         (thinking?.type !== 'disabled' && isThinkingModel(model));
     const thinkingBudget = thinking?.budget_tokens || DEFAULT_THINKING_BUDGET;
 
+    const hasWebSearchTool = hasAnthropicWebSearchTool(tools);
+
     // 获取实际模型名称
-    const actualModel = getMappedModel(model);
+    let actualModel = getMappedModel(model);
+    if (hasWebSearchTool) {
+        // Web search requests should use Gemini's built-in search behavior
+        actualModel = 'gemini-2.5-flash';
+    }
     const isClaudeModel = model.includes('claude');
 
     // Claude thinking：当工具 schema 没有 required 字段时，上游偶发不下发 tool_use/tool_call（只输出 thinking 然后结束）
@@ -131,7 +137,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
                     return false;
                 });
 
-            if (hasOnlyFunctionResponses && !hasNonEmptyText) {
+            if (hasOnlyFunctionResponses && !hasNonEmptyText && shouldInjectClaudeToolResultPlaceholder()) {
                 // 同 OpenAI 端点：避免 "Continue." 误导模型继续调用工具。
                 last.parts.push({ text: CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER });
             }
@@ -164,8 +170,8 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         candidateCount: 1
     };
 
-    // Claude 模型不支持 topP
-    if (!isClaudeModel && top_p !== undefined) {
+    // Claude 模型不支持 topP（web_search 会被映射到 Gemini，可透传 topP）
+    if ((!isClaudeModel || hasWebSearchTool) && top_p !== undefined) {
         generationConfig.topP = top_p;
     }
 
@@ -202,7 +208,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         },
         model: actualModel,
         userAgent: 'antigravity',
-        requestType: 'agent'
+        requestType: hasWebSearchTool ? 'web_search' : 'agent'
     };
 
     // 添加系统指令
@@ -217,6 +223,18 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
 
     // 添加工具定义
     if (tools && tools.length > 0) {
+        if (hasWebSearchTool) {
+            request.request.tools = [{
+                googleSearch: {
+                    enhancedContent: {
+                        imageSearch: {
+                            maxResultCount: 5
+                        }
+                    }
+                }
+            }];
+            return request;
+        }
         // Anthropic 兼容：支持 Claude Code/Anthropic 内置工具（web_search/computer_use/text_editor/bash）
         // 这些工具在 Anthropic 协议中通常以 {type:"bash_YYYYMMDD"} 这种形式出现（没有 name/input_schema）。
         // Antigravity 侧只支持 functionDeclarations，因此这里把它们“降维”成普通函数工具：
@@ -255,6 +273,16 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
     }
 
     return request;
+}
+
+function hasAnthropicWebSearchTool(tools) {
+    if (!Array.isArray(tools)) return false;
+    return tools.some(tool => {
+        if (!tool || typeof tool !== 'object') return false;
+        if (typeof tool.name === 'string' && tool.name.toLowerCase() === 'web_search') return true;
+        const type = typeof tool.type === 'string' ? tool.type : '';
+        return type === 'web_search' || type.startsWith('web_search_');
+    });
 }
 
 function normalizeAnthropicTool(tool, isClaudeModel = false) {

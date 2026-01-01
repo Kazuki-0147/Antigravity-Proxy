@@ -90,25 +90,55 @@ class AccountPool {
     /**
      * 轮询获取账号（简单轮询，不考虑配额）
      */
-    async getNextAccount() {
+    async getNextAccount(model = null) {
         const accounts = getActiveAccounts();
 
         if (accounts.length === 0) {
             throw new Error('No active accounts available');
         }
 
-        // 简单轮询
-        this.lastAccountIndex = (this.lastAccountIndex + 1) % accounts.length;
-        const account = accounts[this.lastAccountIndex];
+        // 严格轮询：稳定顺序（按 id），依次选择下一个可用账号
+        const ordered = [...accounts].sort((a, b) => (a.id || 0) - (b.id || 0));
+        const total = ordered.length;
+        let idx = (this.lastAccountIndex + 1) % total;
 
-        try {
-            const validAccount = await ensureValidToken(account);
-            updateAccountLastUsed(account.id);
-            return validAccount;
-        } catch (error) {
-            // 如果当前账号失败，尝试获取最优账号
-            return this.getBestAccount();
+        for (let i = 0; i < total; i++) {
+            const account = ordered[idx];
+
+            // 检查账号并发是否已满
+            if (!DISABLE_LOCAL_LIMITS && Number.isFinite(MAX_CONCURRENT_PER_ACCOUNT) && MAX_CONCURRENT_PER_ACCOUNT > 0) {
+                const lockCount = this.accountLocks.get(account.id) || 0;
+                if (lockCount >= MAX_CONCURRENT_PER_ACCOUNT) {
+                    idx = (idx + 1) % total;
+                    continue;
+                }
+            }
+
+            // 检查是否处于容量冷却期
+            if (!DISABLE_LOCAL_LIMITS && model && this.isAccountInCooldown(account.id, model)) {
+                idx = (idx + 1) % total;
+                continue;
+            }
+
+            try {
+                const validAccount = await ensureValidToken(account);
+
+                // 锁定账号并发
+                this.lockAccount(account.id);
+
+                // 更新最后使用时间
+                updateAccountLastUsed(account.id);
+
+                this.lastAccountIndex = idx;
+                return validAccount;
+            } catch {
+                // 继续尝试下一个账号
+            }
+
+            idx = (idx + 1) % total;
         }
+
+        throw new Error('No available accounts with valid tokens');
     }
 
     /**
@@ -233,6 +263,14 @@ class AccountPool {
                 ? accounts.reduce((sum, a) => sum + a.quota_remaining, 0) / accounts.length
                 : 0
         };
+    }
+
+    /**
+     * 获取当前可用账号数量（active 且 quota > 0）
+     */
+    getAvailableAccountCount() {
+        const accounts = getActiveAccounts();
+        return accounts.length;
     }
 
     /**

@@ -3,6 +3,19 @@
 // Use a single space to avoid "Continue."-style semantic injection.
 export const CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER = ' ';
 
+function parseBooleanEnv(name, defaultValue) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === null || raw === '') return defaultValue;
+    const v = String(raw).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
+    if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
+    return defaultValue;
+}
+
+export function shouldInjectClaudeToolResultPlaceholder() {
+    return parseBooleanEnv('CLAUDE_TOOL_RESULT_PLACEHOLDER', true);
+}
+
 // Claude thinking + tool calling:
 // when tool schema has no `required`, upstream sometimes outputs only thinking and ends (no tool_call).
 // Fix:
@@ -55,4 +68,3 @@ export function stripClaudeToolRequiredArgPlaceholderFromArgs(args) {
     const { [CLAUDE_TOOL_REQUIRED_ARG_PLACEHOLDER]: _ignored, ...rest } = args;
     return rest;
 }
-

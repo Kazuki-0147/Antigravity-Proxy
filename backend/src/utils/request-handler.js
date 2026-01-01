@@ -24,10 +24,17 @@ export async function runChatWithCapacityRetry({
     buildRequest,
     execute
 }) {
+    const configuredRetries = Math.max(0, Number(maxRetries || 0));
+    const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
+        ? accountPool.getAvailableAccountCount()
+        : 0;
+    // 至少轮询完一遍账号池（遇到 capacity 时再放弃）
+    const effectiveMaxRetries = Math.max(configuredRetries, Math.max(0, availableCount - 1));
+
     const out = await withCapacityRetry({
-        maxRetries,
+        maxRetries: effectiveMaxRetries,
         baseRetryDelayMs,
-        getAccount: async () => accountPool.getBestAccount(model),
+        getAccount: async () => accountPool.getNextAccount(model),
         executeRequest: async ({ account }) => {
             const antigravityRequest = buildRequest(account);
             try {
@@ -59,10 +66,15 @@ export async function runStreamChatWithCapacityRetry({
     canRetry
 }) {
     let attempt = 0;
+    const configuredRetries = Math.max(0, Number(maxRetries || 0));
+    const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
+        ? accountPool.getAvailableAccountCount()
+        : 0;
+    const effectiveMaxRetries = Math.max(configuredRetries, Math.max(0, availableCount - 1));
 
     while (true) {
         attempt++;
-        const account = await accountPool.getBestAccount(model);
+        const account = await accountPool.getNextAccount(model);
         const antigravityRequest = buildRequest(account);
 
         try {
@@ -80,7 +92,7 @@ export async function runStreamChatWithCapacityRetry({
                 accountPool.unlockAccount(account.id);
 
                 const allowByOutput = typeof canRetry === 'function' ? !!canRetry({ attempt, error }) : true;
-                if (allowByOutput && attempt <= Math.max(0, Number(maxRetries || 0)) + 1) {
+                if (allowByOutput && attempt <= Math.max(0, Number(effectiveMaxRetries || 0)) + 1) {
                     const resetMs = parseResetAfterMs(error?.message);
                     const delay = resetMs ?? (Math.max(0, Number(baseRetryDelayMs || 0)) * attempt);
                     await sleep(delay);

@@ -622,6 +622,152 @@ body {
   flex-wrap: nowrap;
 }
 
+/* === 配额弹窗 === */
+.quota-dialog {
+  max-width: 760px;
+  width: min(92vw, 760px);
+}
+
+.quota-dialog .dialog-title {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.quota-dialog .dialog-subtitle {
+  font-size: 14px;
+}
+
+.quota-dialog .dialog-body {
+  font-size: 14px;
+}
+
+.quota-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.quota-card {
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-2);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+}
+
+.quota-card-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-tertiary);
+}
+
+.quota-card-value {
+  margin-top: 6px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.quota-card-value--mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.quota-empty {
+  padding: 32px 0 8px;
+}
+
+.quota-table .table {
+  font-size: 14px;
+}
+
+.quota-table .table th {
+  font-size: 11px;
+}
+
+.quota-table .table td {
+  vertical-align: top;
+}
+
+.quota-model-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.quota-model-id {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  word-break: break-all;
+}
+
+.quota-meter {
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.quota-meter-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.quota-percent {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.quota-fraction {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+
+.quota-bar {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-2);
+  overflow: hidden;
+}
+
+.quota-bar-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  transition: width var(--transition-slow);
+  background: linear-gradient(90deg, var(--color-primary), var(--color-primary-hover));
+}
+
+.quota-bar-fill.good {
+  background: linear-gradient(90deg, var(--color-success), #34d399);
+}
+
+.quota-bar-fill.warn {
+  background: linear-gradient(90deg, var(--color-warning), #fbbf24);
+}
+
+.quota-bar-fill.danger {
+  background: linear-gradient(90deg, var(--color-danger), #f87171);
+}
+
+.quota-bar-fill.unknown {
+  background: linear-gradient(90deg, var(--color-text-tertiary), #6b7280);
+}
+
+.quota-reset {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
 /* 错误信息可展开 */
 .error-cell {
   position: relative;
