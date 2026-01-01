@@ -203,33 +203,72 @@ export class AccountsPage extends Component {
     } else if (data) {
       const quotaData = data?.data || data;
       const quotas = quotaData?.quotas || {};
-      
+      const overallQuota = typeof quotaData?.overallQuota === 'number' && Number.isFinite(quotaData.overallQuota)
+        ? Math.max(0, Math.min(1, quotaData.overallQuota))
+        : null;
+      const overallText = overallQuota === null ? '-' : `${(overallQuota * 100).toFixed(2)}%`;
+      const overallReset = this._escape(formatTime(quotaData?.resetTime));
+
+      const summary = `
+        <div class="quota-summary">
+          <div class="quota-card">
+            <div class="quota-card-label">总体剩余</div>
+            <div class="quota-card-value">${this._escape(overallText)}</div>
+          </div>
+          <div class="quota-card">
+            <div class="quota-card-label">最近重置</div>
+            <div class="quota-card-value quota-card-value--mono">${overallReset}</div>
+          </div>
+        </div>
+      `;
+
       if (Object.keys(quotas).length === 0) {
-        content = '<div class="text-center text-secondary" style="padding:48px">无配额数据</div>';
+        content = `
+          ${summary}
+          <div class="text-center text-secondary quota-empty">无配额数据</div>
+        `;
       } else {
         const rows = Object.entries(quotas).map(([modelId, info]) => {
           const remaining = typeof info?.remainingFraction === 'number' && Number.isFinite(info.remainingFraction)
             ? Math.max(0, Math.min(1, info.remainingFraction))
             : null;
-          const remainingText = remaining === null ? '-' : `${(remaining * 100).toFixed(2)}%`;
+          const percent = remaining === null ? null : remaining * 100;
+          const percentText = percent === null ? '未知' : `${percent.toFixed(2)}%`;
+          const barWidth = percent === null ? 0 : Math.max(0, Math.min(100, percent));
+          const barClass = remaining === null ? 'unknown' : (remaining < 0.2 ? 'danger' : (remaining < 0.5 ? 'warn' : 'good'));
+          const displayName = info?.displayName || modelId;
 
           return `
             <tr>
-              <td class="mono" style="font-size:11px">${this._escape(modelId)}</td>
-              <td>${this._escape(info?.displayName || '')}</td>
-              <td class="mono">${this._escape(remainingText)}</td>
-              <td class="mono" style="font-size:11px">${formatTime(info?.resetTime)}</td>
+              <td>
+                <div class="quota-model">
+                  <div class="quota-model-name">${this._escape(displayName)}</div>
+                  <div class="quota-model-id mono">${this._escape(modelId)}</div>
+                </div>
+              </td>
+              <td>
+                <div class="quota-meter">
+                  <div class="quota-meter-header">
+                    <span class="quota-percent">${this._escape(percentText)}</span>
+                    ${remaining === null ? '' : `<span class="quota-fraction mono">${remaining.toFixed(4)}</span>`}
+                  </div>
+                  <div class="quota-bar">
+                    <span class="quota-bar-fill ${barClass}" style="width:${barWidth}%"></span>
+                  </div>
+                </div>
+              </td>
+              <td class="quota-reset mono">${formatTime(info?.resetTime)}</td>
             </tr>
           `;
         }).join('');
 
         content = `
-          <div class="table-wrapper">
+          ${summary}
+          <div class="table-wrapper quota-table">
             <table class="table">
               <thead>
                 <tr>
-                  <th>模型 ID</th>
-                  <th>名称</th>
+                  <th>模型</th>
                   <th>剩余额度</th>
                   <th>重置时间</th>
                 </tr>
@@ -244,7 +283,7 @@ export class AccountsPage extends Component {
     }
 
     return `
-      <dialog id="quotaDialog">
+      <dialog id="quotaDialog" class="quota-dialog">
         <div class="dialog-header">
           <div class="dialog-title">配额详情</div>
           <div class="dialog-subtitle">${this._escape(account?.email || '')}</div>

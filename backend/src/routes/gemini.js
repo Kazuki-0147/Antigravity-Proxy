@@ -90,7 +90,7 @@ export default async function geminiRoutes(fastify) {
     }, async (request, reply) => {
         let account = null;
         try {
-            account = await accountPool.getBestAccount('gemini-2.5-flash');
+            account = await accountPool.getNextAccount('gemini-2.5-flash');
             const payload = await fetchAvailableModels(account);
             const entries = parseModelsFromFetchAvailableModels(payload);
             const models = entries
@@ -121,7 +121,7 @@ export default async function geminiRoutes(fastify) {
 
         let account = null;
         try {
-            account = await accountPool.getBestAccount('gemini-2.5-flash');
+            account = await accountPool.getNextAccount('gemini-2.5-flash');
             const payload = await fetchAvailableModels(account);
             const entries = parseModelsFromFetchAvailableModels(payload);
             const models = entries

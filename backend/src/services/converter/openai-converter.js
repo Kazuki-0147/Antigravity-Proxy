@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { AVAILABLE_MODELS, getMappedModel, isThinkingModel } from '../../config.js';
 
-import { CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER, injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
+import { CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER, injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, shouldInjectClaudeToolResultPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
 import { convertTool, generateSessionId, parseDataUrl } from './schema-converter.js';
 import { cacheClaudeToolThinking, cacheToolThoughtSignature, getCachedClaudeToolThinking, getCachedToolThoughtSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
@@ -245,7 +245,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                     return false;
                 });
 
-            if (hasOnlyFunctionResponses && !hasNonEmptyText) {
+            if (hasOnlyFunctionResponses && !hasNonEmptyText && shouldInjectClaudeToolResultPlaceholder()) {
                 last.parts.push({ text: CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER });
             }
         }
@@ -833,4 +833,3 @@ export function getModelsList() {
         }))
     };
 }
-

@@ -1,7 +1,56 @@
 import { ANTIGRAVITY_CONFIG } from '../config.js';
+import fs from 'fs';
 
 const BASE_URL = ANTIGRAVITY_CONFIG.base_url;
 const USER_AGENT = ANTIGRAVITY_CONFIG.user_agent;
+const UPSTREAM_REQUEST_CAPTURE_ENABLED = (() => {
+    const raw = process.env.UPSTREAM_REQUEST_CAPTURE;
+    if (raw === undefined || raw === null || raw === '') return false;
+    const v = String(raw).trim().toLowerCase();
+    return ['1', 'true', 'yes', 'y', 'on'].includes(v);
+})();
+const UPSTREAM_REQUEST_CAPTURE_PATH = process.env.UPSTREAM_REQUEST_CAPTURE_PATH || '/app/data/upstream_requests.log';
+const UPSTREAM_SSE_CAPTURE_ENABLED = (() => {
+    const raw = process.env.UPSTREAM_SSE_CAPTURE;
+    if (raw === undefined || raw === null || raw === '') return false;
+    const v = String(raw).trim().toLowerCase();
+    return ['1', 'true', 'yes', 'y', 'on'].includes(v);
+})();
+const UPSTREAM_SSE_CAPTURE_PATH = process.env.UPSTREAM_SSE_CAPTURE_PATH || '/app/data/upstream_sse.log';
+
+function captureUpstreamRequest(kind, url, request) {
+    if (!UPSTREAM_REQUEST_CAPTURE_ENABLED) return;
+    if (!request || typeof request !== 'object') return;
+    try {
+        const line = JSON.stringify({
+            ts: Date.now(),
+            kind: kind || null,
+            url: url || null,
+            requestId: request.requestId || null,
+            model: request.model || null,
+            requestType: request.requestType || null,
+            body: request
+        });
+        fs.appendFile(UPSTREAM_REQUEST_CAPTURE_PATH, line + '\n', () => {});
+    } catch {
+        // ignore capture failures
+    }
+}
+
+function captureUpstreamSse(requestId, payload) {
+    if (!UPSTREAM_SSE_CAPTURE_ENABLED) return;
+    if (!payload) return;
+    try {
+        const line = JSON.stringify({
+            ts: Date.now(),
+            requestId: requestId || null,
+            payload: String(payload)
+        });
+        fs.appendFile(UPSTREAM_SSE_CAPTURE_PATH, line + '\n', () => {});
+    } catch {
+        // ignore capture failures
+    }
+}
 
 /**
  * 流式聊天请求
@@ -15,6 +64,7 @@ export async function streamChat(account, request, onData, onError, signal = nul
     const url = `${BASE_URL}/v1internal:streamGenerateContent?alt=sse`;
 
     try {
+        captureUpstreamRequest('stream', url, request);
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -56,6 +106,7 @@ export async function streamChat(account, request, onData, onError, signal = nul
         const handleData = (data) => {
             const payload = String(data ?? '').trim();
             if (!payload || payload === '[DONE]') return;
+            captureUpstreamSse(request?.requestId, payload);
 
             // 上游可能在 SSE 中返回结构化错误/安全拦截信息（HTTP 200 但无 candidates）
             // 这种情况下，如果我们不处理，客户端会看到“空回复且不报错”
@@ -149,6 +200,7 @@ export async function streamChat(account, request, onData, onError, signal = nul
 export async function chat(account, request) {
     const url = `${BASE_URL}/v1internal:generateContent`;
 
+    captureUpstreamRequest('chat', url, request);
     const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -190,6 +242,7 @@ export async function chat(account, request) {
 export async function countTokens(account, request) {
     const url = `${BASE_URL}/v1internal:countTokens`;
 
+    captureUpstreamRequest('countTokens', url, request);
     const response = await fetch(url, {
         method: 'POST',
         headers: {
