@@ -46,7 +46,7 @@ npm start
 
 1) 打开管理面板：`http://127.0.0.1:${PORT:-8088}`，使用 `ADMIN_PASSWORD` 登录。
 
-2) 添加账号（Accounts）：
+2) 添加账号：
 - **OAuth 绑定**：`OAuth` → 浏览器授权 → 复制回调 URL 粘贴回面板 → 完成添加
 - **手动添加**：填 `email` + `refresh_token`
 
