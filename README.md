@@ -229,7 +229,7 @@ curl "http://localhost:8088/v1beta/models/gemini-3-pro-image:generateContent" \
 - OpenAI：`messages[].content` 支持 `[{ "type":"text" }, { "type":"image_url" }]`；`image_url.url` 可用 `data:<mime>;base64,...` 或纯 base64（默认按 png）。
 - Anthropic：`messages[].content` 支持 `type:"image"` 且 `source.type:"base64"`。
 
-## Claude Code 兼容性说明（thinking / tools / web search）
+## Claude Code 兼容性说明（thinking / tools）
 
 ### 1) Anthropic extended thinking 的 signature 回放
 
