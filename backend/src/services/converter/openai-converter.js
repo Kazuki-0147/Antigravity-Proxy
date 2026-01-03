@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { AVAILABLE_MODELS, getMappedModel, isThinkingModel } from '../../config.js';
 
-import { CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER, injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, shouldInjectClaudeToolResultPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
+import { injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
 import { convertTool, generateSessionId, parseDataUrl } from './schema-converter.js';
 import { cacheClaudeToolThinking, cacheToolThoughtSignature, getCachedClaudeToolThinking, getCachedToolThoughtSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
@@ -11,6 +11,7 @@ import { createToolOutputLimiter, limitToolOutput } from './tool-output-limiter.
 // Defaults
 const DEFAULT_THINKING_BUDGET = 4096;
 const DEFAULT_TEMPERATURE = 1;
+const CLAUDE_TOOL_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
 
 // Tool-chain: cap max_tokens when request contains tools/tool_results (disabled by default)
 const MAX_OUTPUT_TOKENS_WITH_TOOLS = Number(process.env.MAX_OUTPUT_TOKENS_WITH_TOOLS ?? 0);
@@ -73,7 +74,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 
     // Extract system messages
     const systemMessages = messages.filter((m) => m.role === 'system');
-    const systemContent = systemMessages
+    let systemContent = systemMessages
         .map((m) => (typeof m.content === 'string' ? m.content : m.content.map((c) => c.text || '').join('\n')))
         .join('\n');
 
@@ -137,7 +138,6 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         }
 
         if (missingIds.length > 0) {
-            enableThinking = false;
             logThinkingDowngrade({
                 provider: 'openai',
                 route: '/v1/chat/completions',
@@ -146,7 +146,8 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                 reason: 'missing_thinking_signature_for_tool_use_history',
                 missing_tool_use_ids: missingIds.slice(0, 50),
                 missing_count: missingIds.length,
-                request_id: requestId
+                request_id: requestId,
+                note: 'using sentinel thoughtSignature for missing tool_call signatures'
             });
         }
     }
@@ -228,26 +229,10 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         }
     }
 
-    // Claude (thinking) tool chain compatibility:
-    // If last user message contains only functionResponses, upstream often emits no thought parts.
-    // Append a minimal text placeholder (space) to trigger thought output without semantic "Continue." injection.
-    if (isClaudeModel && enableThinking && contents.length > 0) {
-        const last = contents[contents.length - 1];
-        if (last?.role === 'user' && Array.isArray(last.parts) && last.parts.length > 0) {
-            const hasFunctionResponse = last.parts.some((p) => p && typeof p === 'object' && p.functionResponse);
-            const hasNonEmptyText = last.parts.some((p) => typeof p?.text === 'string' && p.text.trim() !== '');
-            const hasOnlyFunctionResponses =
-                hasFunctionResponse &&
-                last.parts.every((p) => {
-                    if (!p || typeof p !== 'object') return false;
-                    if (p.functionResponse) return true;
-                    if (typeof p.text === 'string' && p.text.trim() === '') return true;
-                    return false;
-                });
-
-            if (hasOnlyFunctionResponses && !hasNonEmptyText && shouldInjectClaudeToolResultPlaceholder()) {
-                last.parts.push({ text: CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER });
-            }
+    if (isClaudeModel && enableThinking && hasTools) {
+        const interleavedHint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.';
+        if (!systemContent.includes(interleavedHint)) {
+            systemContent = systemContent ? `${systemContent}\n\n${interleavedHint}` : interleavedHint;
         }
     }
 
@@ -410,7 +395,7 @@ function convertMessage(msg, ctx = {}) {
         // tool_calls
         for (const toolCall of msg.tool_calls) {
             const toolCallId = toolCall.id || `call_${uuidv4().slice(0, 8)}`;
-            const thoughtSignature = getCachedToolThoughtSignature(toolCallId);
+            let thoughtSignature = getCachedToolThoughtSignature(toolCallId);
             let args = {};
             try {
                 args = JSON.parse(toolCall.function.arguments || '{}');
@@ -425,6 +410,9 @@ function convertMessage(msg, ctx = {}) {
                 claudeToolsNeedingRequiredPlaceholder.has(toolCall.function.name)
             ) {
                 args = injectClaudeToolRequiredArgPlaceholderIntoArgs(args || {});
+            }
+            if (!thoughtSignature && isClaudeModel && enableThinking) {
+                thoughtSignature = CLAUDE_TOOL_SIGNATURE_SENTINEL;
             }
             parts.push({
                 ...(thoughtSignature ? { thoughtSignature } : {}),

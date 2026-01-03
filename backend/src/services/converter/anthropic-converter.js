@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { getMappedModel, isThinkingModel } from '../../config.js';
 
-import { CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER, injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, shouldInjectClaudeToolResultPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
+import { injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
 import { convertJsonSchema, generateSessionId } from './schema-converter.js';
 import { cacheClaudeAssistantSignature, cacheClaudeLastThinkingSignature, cacheClaudeThinkingSignature, getCachedClaudeAssistantSignature, getCachedClaudeLastThinkingSignature, getCachedClaudeThinkingSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
@@ -11,6 +11,7 @@ import { createToolOutputLimiter, limitToolOutput } from './tool-output-limiter.
 // Defaults
 const DEFAULT_THINKING_BUDGET = 4096;
 const DEFAULT_TEMPERATURE = 1;
+const CLAUDE_TOOL_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
 
 // Tool-chain: cap overly large max_tokens when tools/tool_results exist (disabled by default)
 const MAX_OUTPUT_TOKENS_WITH_TOOLS = Number(process.env.MAX_OUTPUT_TOKENS_WITH_TOOLS ?? 0);
@@ -49,6 +50,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
     const thinkingBudget = thinking?.budget_tokens || DEFAULT_THINKING_BUDGET;
 
     const hasWebSearchTool = hasAnthropicWebSearchTool(tools);
+    const userKey = anthropicRequest?.metadata?.user_id || null;
 
     // 获取实际模型名称
     let actualModel = getMappedModel(model);
@@ -116,32 +118,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
             }
         }
 
-        contents.push(convertAnthropicMessage(msg, thinkingEnabled, { isClaudeModel, thinkingEnabled, claudeToolsNeedingRequiredPlaceholder }));
-    }
-
-    // Claude（thinking）工具链路兼容：
-    // 与 OpenAI 端点同理：当最后一条 user 消息只包含 tool_result（转换后为 functionResponse）时，
-    // 上游经常不再输出 thought parts，导致客户端只能看到“空 thinking 块”。
-    // 给最后一条 user message 追加一个极短文本，提升“工具后仍输出思维链”的稳定性。
-    if (isClaudeModel && thinkingEnabled && contents.length > 0) {
-        const last = contents[contents.length - 1];
-        if (last?.role === 'user' && Array.isArray(last.parts) && last.parts.length > 0) {
-            const hasFunctionResponse = last.parts.some(p => p && typeof p === 'object' && p.functionResponse);
-            const hasNonEmptyText = last.parts.some(p => typeof p?.text === 'string' && p.text.trim() !== '');
-            const hasOnlyFunctionResponses =
-                hasFunctionResponse &&
-                last.parts.every(p => {
-                    if (!p || typeof p !== 'object') return false;
-                    if (p.functionResponse) return true;
-                    if (typeof p.text === 'string' && p.text.trim() === '') return true;
-                    return false;
-                });
-
-            if (hasOnlyFunctionResponses && !hasNonEmptyText && shouldInjectClaudeToolResultPlaceholder()) {
-                // 同 OpenAI 端点：避免 "Continue." 误导模型继续调用工具。
-                last.parts.push({ text: CLAUDE_TOOL_RESULT_TEXT_PLACEHOLDER });
-            }
-        }
+        contents.push(convertAnthropicMessage(msg, thinkingEnabled, { isClaudeModel, thinkingEnabled, claudeToolsNeedingRequiredPlaceholder, userKey }));
     }
 
     // 构建 generationConfig
@@ -212,9 +189,17 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
     };
 
     // 添加系统指令
-    if (system) {
-        const systemContent = typeof system === 'string' ? system :
-            system.map(s => s.text || '').join('\n');
+    const shouldAddInterleavedHint = isClaudeModel && thinkingEnabled && Array.isArray(tools) && tools.length > 0;
+    const interleavedHint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.';
+    if (system || shouldAddInterleavedHint) {
+        let systemContent = typeof system === 'string'
+            ? system
+            : Array.isArray(system)
+                ? system.map(s => s.text || '').join('\n')
+                : '';
+        if (shouldAddInterleavedHint && !systemContent.includes(interleavedHint)) {
+            systemContent = systemContent ? `${systemContent}\n\n${interleavedHint}` : interleavedHint;
+        }
         request.request.systemInstruction = {
             role: 'user',
             parts: [{ text: systemContent }]
@@ -403,7 +388,7 @@ function getBuiltinAnthropicToolSchema(name) {
  * 转换 Anthropic 格式的单条消息
  */
 function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
-    const { isClaudeModel = false, claudeToolsNeedingRequiredPlaceholder = null } = ctx;
+    const { isClaudeModel = false, claudeToolsNeedingRequiredPlaceholder = null, userKey = null } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
     // 简单文本消息
@@ -418,6 +403,7 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
     if (Array.isArray(msg.content)) {
         const regularParts = [];
         const functionCallParts = [];
+        let currentMessageThinkingSignature = null;
 
 	    for (const item of msg.content) {
 	            // 处理 thinking 块 - 保留为 thought 部分
@@ -433,6 +419,7 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
                     // 兼容 Vertex/部分中间层：如果带 signature 但 thinking 为空字符串，
                     // 可能在上游序列化时被当作“未设置”导致校验失败；用空格占位保证字段存在。
                     const thinkingText = (rawSignature && rawThinking === '') ? ' ' : rawThinking;
+                    if (rawSignature) currentMessageThinkingSignature = rawSignature;
 
 	                regularParts.push({
 	                    text: thinkingText,
@@ -445,14 +432,15 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
             // 处理 redacted_thinking 块
             // - 若包含 signature：可安全透传为 thought part（text 为空即可）
             // - 若缺少 signature：不透传（否则会触发上游校验失败），交给 preprocess 做降级/清洗
-	            if (item.type === 'redacted_thinking') {
-                    const sig =
-                        item.signature ||
-                        (item.redacted_thinking && typeof item.redacted_thinking.signature === 'string' ? item.redacted_thinking.signature : undefined);
-	                if (sig) {
-	                    regularParts.push({
-	                        text: ' ',
-	                        thought: true,
+            if (item.type === 'redacted_thinking') {
+                const sig =
+                    item.signature ||
+                    (item.redacted_thinking && typeof item.redacted_thinking.signature === 'string' ? item.redacted_thinking.signature : undefined);
+                if (sig) {
+                    currentMessageThinkingSignature = sig;
+	                regularParts.push({
+	                    text: ' ',
+	                    thought: true,
 	                        thoughtSignature: sig
 	                    });
 	                }
@@ -477,7 +465,25 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
                 ) {
                     args = injectClaudeToolRequiredArgPlaceholderIntoArgs(args || {});
                 }
+                let thoughtSignature = null;
+                if (isClaudeModel) {
+                    if (currentMessageThinkingSignature) {
+                        thoughtSignature = currentMessageThinkingSignature;
+                    } else if (item?.id) {
+                        thoughtSignature = getCachedClaudeThinkingSignature(item.id);
+                    }
+                    if (!thoughtSignature && userKey) {
+                        thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
+                        if (thoughtSignature && item?.id) {
+                            cacheClaudeThinkingSignature(item.id, thoughtSignature);
+                        }
+                    }
+                    if (!thoughtSignature) {
+                        thoughtSignature = CLAUDE_TOOL_SIGNATURE_SENTINEL;
+                    }
+                }
                 functionCallParts.push({
+                    ...(thoughtSignature ? { thoughtSignature } : {}),
                     functionCall: {
                         id: item.id,
                         name: item.name,

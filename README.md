@@ -11,6 +11,8 @@
 - **稳定性增强**：按模型/按账号并发限制 + 上游容量错误退避/切号重试（减少 `Resource has been exhausted`）
 - **Claude thinking + tools 兼容**：
   - 自动缓存/回放 `thinking.signature`（Anthropic 端点：落库持久化；OpenAI 端点：代理内缓存回放）
+  - tool_use 自动补齐 `thoughtSignature`，缺失时使用 `skip_thought_signature_validator` 兜底（无需空占位）
+  - Claude + tools + thinking 时追加 interleaved thinking 提示，支持工具后继续输出思维链
 
 ## 快速开始
 
@@ -64,6 +66,7 @@ curl "http://localhost:8088/v1/chat/completions" \
 说明：
 - 代理不会替你执行 `tools/tool_calls`，需要客户端执行工具后用 `role:"tool"` 回传。
 - 上游可能要求回放工具调用链路的 `thoughtSignature`；本代理会自动缓存并在下一轮回放补齐。
+- Claude 模型在 tool_call 上会自动带 `thoughtSignature`，缺失时使用 `skip_thought_signature_validator` 兜底（不再插入空文本占位）。
 
 示例（两轮）：
 
@@ -236,6 +239,7 @@ Anthropic extended thinking 对包含 `tool_use` 的历史消息有强校验：�
 代理的处理策略：
 - 优先从 **`tool_use_id -> signature` 缓存**恢复并补齐（持久化到 SQLite，避免容器重启丢失）。
 - 若某些回合上游未再次下发 signature，使用 **`user_id -> last signature`** 作为兜底，让工具链路不断档。
+- 若本回合仍无法拿到签名，`tool_use` 会自动附带 `skip_thought_signature_validator` 兜底（避免工具链路中断）。
 - 如果仍无法恢复（例如缓存过期且客户端也没回放），会把本次请求的 `thinking` 自动设置为 `disabled`，并清理无效 `thinking` 块，避免上游直接 400；同时会在日志中输出 `thinking_downgrade`。
 
 实现位置：`backend/src/services/converter.js` → `preprocessAnthropicRequest()`。
@@ -328,7 +332,7 @@ Anthropic extended thinking 对包含 `tool_use` 的历史消息有强校验：�
 
 ### 2) `thinking_downgrade` 日志
 
-含义：某条历史 `tool_use` 的 `signature` 无法恢复（缓存过期/丢失且客户端未回放），因此本次请求被迫禁用 thinking 以避免上游报错。
+含义：某条历史 `tool_use` 的 `signature` 无法恢复（缓存过期/丢失且客户端未回放），因此 Anthropic 端点本次请求被迫禁用 thinking 以避免上游报错。
 
 ## 项目结构
 
