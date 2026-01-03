@@ -11,8 +11,8 @@
 - **稳定性增强**：按模型/按账号并发限制 + 上游容量错误退避/切号重试（减少 `Resource has been exhausted`）
 - **Claude thinking + tools 兼容**：
   - 自动缓存/回放 `thinking.signature`（Anthropic 端点：落库持久化；OpenAI 端点：代理内缓存回放）
-  - tool_use 自动补齐 `thoughtSignature`，缺失时使用 `skip_thought_signature_validator` 兜底（无需空占位）
-  - Claude + tools + thinking 时追加 interleaved thinking 提示，支持工具后继续输出思维链
+  - tool_use 自动补齐 `thoughtSignature`，缺失时使用 `skip_thought_signature_validator` 兜底
+  - Claude + tools + thinking 时追加 interleaved thinking 提示，支持工具调用时交错思考
 
 ## 快速开始
 
@@ -61,10 +61,9 @@ curl "http://localhost:8088/v1/chat/completions" \
   -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-### OpenAI：工具调用（代理只透传）
+### OpenAI：工具调用
 
 说明：
-- 代理不会替你执行 `tools/tool_calls`，需要客户端执行工具后用 `role:"tool"` 回传。
 - 上游可能要求回放工具调用链路的 `thoughtSignature`；本代理会自动缓存并在下一轮回放补齐。
 - Claude 模型在 tool_call 上会自动带 `thoughtSignature`，缺失时使用 `skip_thought_signature_validator` 兜底（不再插入空文本占位）。
 
@@ -200,7 +199,7 @@ curl "http://localhost:8088/v1/messages" \
 curl "http://localhost:8088/v1/models" -H "Authorization: Bearer ${API_KEY}"
 ```
 
-## Gemini 原生端点（v1beta，主要用于 Image 生成）
+## Gemini 原生端点
 
 本项目额外提供了一个 **Gemini 原生**兼容端点（最小实现），用于 `gemini-3-pro-image` 等场景透传 `generationConfig.imageConfig`，也可用于其它 Gemini 模型的原生调用。
 
@@ -232,7 +231,7 @@ curl "http://localhost:8088/v1beta/models/gemini-3-pro-image:generateContent" \
 
 ## Claude Code 兼容性说明（thinking / tools / web search）
 
-### 1) Anthropic extended thinking 的 signature 回放（重要）
+### 1) Anthropic extended thinking 的 signature 回放
 
 Anthropic extended thinking 对包含 `tool_use` 的历史消息有强校验：历史 assistant 必须以 `thinking/redacted_thinking` 开头且带 `signature`。
 
