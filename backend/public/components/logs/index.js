@@ -84,7 +84,7 @@ export class LogsPage extends Component {
 
   _renderStats(stats) {
     return `
-      <div class="stats-grid mb-4" style="grid-template-columns: repeat(3, 1fr)">
+      <div class="stats-grid stats-grid--logs mb-4">
         <div class="card">
           <div class="card-title">总请求</div>
           <div class="card-value">${formatNumber(stats.total || 0)}</div>
@@ -128,19 +128,19 @@ export class LogsPage extends Component {
 
       return `
         <tr>
-          <td class="mono" style="font-size:11px;white-space:nowrap">
+          <td class="mono" data-label="时间" style="font-size:11px;white-space:nowrap">
             ${formatTime(l.created_at)}
           </td>
-          <td class="mono" style="font-size:12px">${this._escape(l.model)}</td>
-          <td style="font-size:12px">${this._escape(l.account_email || '-')}</td>
-          <td>
+          <td class="mono" data-label="模型" style="font-size:12px">${this._escape(l.model)}</td>
+          <td data-label="账号" style="font-size:12px">${this._escape(l.account_email || '-')}</td>
+          <td data-label="状态">
             <span class="badge ${isError ? 'badge-danger' : 'badge-success'}">
               ${isError ? '失败' : '成功'}
             </span>
           </td>
-          <td class="mono">${formatNumber(l.total_tokens)}</td>
-          <td class="mono">${l.latency_ms}ms</td>
-          <td class="error-cell">
+          <td class="mono" data-label="Token">${formatNumber(l.total_tokens)}</td>
+          <td class="mono" data-label="延迟">${l.latency_ms}ms</td>
+          <td class="error-cell" data-label="错误信息">
             ${errorMsg 
               ? `<span class="error-text">${this._escape(errorMsg)}</span><div class="error-tooltip" role="tooltip">${this._escape(errorMsg)}</div>` 
               : '<span class="text-secondary">-</span>'
@@ -171,6 +171,11 @@ export class LogsPage extends Component {
     const estimatedTotal = pagination.total || (
       list.length === pagination.pageSize ? pagination.page * pagination.pageSize + 1 : list.length
     );
+
+    if (this._pagination && this._pagination.container !== container) {
+      this._pagination.unmount();
+      this._pagination = null;
+    }
 
     if (this._pagination) {
       this._pagination.setProps({
