@@ -12,7 +12,7 @@
 - **流式输出** — 完整 SSE 支持，包括 thinking 流式输出
 - **工具调用** — OpenAI function calling / Anthropic tool_use 完整支持
 - **多模态** — 图片输入、图片生成（gemini-3-pro-image）
-- **Claude Code 兼容** — thinking signature 自动缓存回放，无需手动处理
+- **Claude Code 兼容** — thinking signature 自动缓存回放
 
 ## 支持模型
 
