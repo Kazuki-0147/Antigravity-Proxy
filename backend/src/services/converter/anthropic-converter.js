@@ -105,19 +105,7 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
                         tool_name: toolName,
                         tool_use_id: tr.tool_use_id
                     });
-
-                    // 为 Claude thinking 模式添加 thoughtSignature，使上游能够继续交错思考
-                    let thoughtSignature = null;
-                    if (isClaudeModel && thinkingEnabled) {
-                        // 优先从 tool_use_id 对应的缓存恢复，其次从用户最后一次签名恢复
-                        thoughtSignature = getCachedClaudeThinkingSignature(tr.tool_use_id);
-                        if (!thoughtSignature && userKey) {
-                            thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
-                        }
-                    }
-
                     return {
-                        ...(thoughtSignature ? { thoughtSignature } : {}),
                         functionResponse: {
                             id: tr.tool_use_id,
                             name: toolName,
@@ -521,17 +509,7 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
 
             // 处理工具结果
             if (item.type === 'tool_result') {
-                // 为 Claude thinking 模式添加 thoughtSignature，使上游能够继续交错思考
-                let thoughtSignature = null;
-                if (isClaudeModel && thinkingEnabled) {
-                    thoughtSignature = getCachedClaudeThinkingSignature(item.tool_use_id);
-                    if (!thoughtSignature && userKey) {
-                        thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
-                    }
-                }
-
                 regularParts.push({
-                    ...(thoughtSignature ? { thoughtSignature } : {}),
                     functionResponse: {
                         id: item.tool_use_id,
                         name: item.name || 'unknown',

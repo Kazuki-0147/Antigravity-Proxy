@@ -4,7 +4,7 @@ import { AVAILABLE_MODELS, getMappedModel, isThinkingModel } from '../../config.
 
 import { injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
 import { convertTool, generateSessionId, parseDataUrl } from './schema-converter.js';
-import { cacheClaudeToolThinking, cacheToolThoughtSignature, getCachedClaudeLastThinkingSignature, getCachedClaudeThinkingSignature, getCachedClaudeToolThinking, getCachedToolThoughtSignature, logThinkingDowngrade } from './signature-cache.js';
+import { cacheClaudeToolThinking, cacheToolThoughtSignature, getCachedClaudeToolThinking, getCachedToolThoughtSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
 import { createToolOutputLimiter, limitToolOutput } from './tool-output-limiter.js';
 
@@ -65,7 +65,6 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     } = openaiRequest;
 
     const requestId = `agent-${uuidv4()}`;
-    const userKey = openaiRequest?.user || openaiRequest?.metadata?.user_id || null;
     const toolOutputLimiter = createToolOutputLimiter({
         provider: 'openai',
         route: '/v1/chat/completions',
@@ -195,18 +194,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                         tool_name: toolMsg.name || 'unknown',
                         tool_call_id: toolMsg.tool_call_id
                     });
-
-                    // 为 Claude thinking 模式添加 thoughtSignature，使上游能够继续交错思考
-                    let thoughtSignature = null;
-                    if (isClaudeModel && enableThinking) {
-                        thoughtSignature = getCachedClaudeThinkingSignature(toolMsg.tool_call_id);
-                        if (!thoughtSignature && userKey) {
-                            thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
-                        }
-                    }
-
                     toolParts.push({
-                        ...(thoughtSignature ? { thoughtSignature } : {}),
                         functionResponse: {
                             id: toolMsg.tool_call_id,
                             name: toolMsg.name || 'unknown',
@@ -237,7 +225,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                 }
                 continue;
             }
-            contents.push(convertMessage(msg, { isClaudeModel, enableThinking, claudeToolsNeedingRequiredPlaceholder, userKey }));
+            contents.push(convertMessage(msg, { isClaudeModel, enableThinking, claudeToolsNeedingRequiredPlaceholder }));
         }
     }
 
@@ -356,26 +344,15 @@ function convertMessage(msg, ctx = {}) {
     const {
         isClaudeModel = false,
         enableThinking = false,
-        claudeToolsNeedingRequiredPlaceholder = null,
-        userKey = null
+        claudeToolsNeedingRequiredPlaceholder = null
     } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
     // tool result
     if (msg.role === 'tool') {
-        // 为 Claude thinking 模式添加 thoughtSignature，使上游能够继续交错思考
-        let thoughtSignature = null;
-        if (isClaudeModel && enableThinking) {
-            thoughtSignature = getCachedClaudeThinkingSignature(msg.tool_call_id);
-            if (!thoughtSignature && userKey) {
-                thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
-            }
-        }
-
         return {
             role: 'user',
             parts: [{
-                ...(thoughtSignature ? { thoughtSignature } : {}),
                 functionResponse: {
                     id: msg.tool_call_id,
                     name: msg.name || 'unknown',
