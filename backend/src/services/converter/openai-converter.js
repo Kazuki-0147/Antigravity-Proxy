@@ -4,7 +4,7 @@ import { AVAILABLE_MODELS, getMappedModel, isThinkingModel } from '../../config.
 
 import { injectClaudeToolRequiredArgPlaceholderIntoArgs, injectClaudeToolRequiredArgPlaceholderIntoSchema, needsClaudeToolRequiredArgPlaceholder, stripClaudeToolRequiredArgPlaceholderFromArgs } from './claude-tool-placeholder.js';
 import { convertTool, generateSessionId, parseDataUrl } from './schema-converter.js';
-import { cacheClaudeToolThinking, cacheToolThoughtSignature, getCachedClaudeToolThinking, getCachedToolThoughtSignature, logThinkingDowngrade } from './signature-cache.js';
+import { cacheClaudeToolThinking, cacheToolThoughtSignature, getCachedClaudeLastThinkingSignature, getCachedClaudeThinkingSignature, getCachedClaudeToolThinking, getCachedToolThoughtSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
 import { createToolOutputLimiter, limitToolOutput } from './tool-output-limiter.js';
 
@@ -65,6 +65,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     } = openaiRequest;
 
     const requestId = `agent-${uuidv4()}`;
+    const userKey = openaiRequest?.user || openaiRequest?.metadata?.user_id || null;
     const toolOutputLimiter = createToolOutputLimiter({
         provider: 'openai',
         route: '/v1/chat/completions',
@@ -194,7 +195,18 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                         tool_name: toolMsg.name || 'unknown',
                         tool_call_id: toolMsg.tool_call_id
                     });
+
+                    // 为 Claude thinking 模式添加 thoughtSignature，使上游能够继续交错思考
+                    let thoughtSignature = null;
+                    if (isClaudeModel && enableThinking) {
+                        thoughtSignature = getCachedClaudeThinkingSignature(toolMsg.tool_call_id);
+                        if (!thoughtSignature && userKey) {
+                            thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
+                        }
+                    }
+
                     toolParts.push({
+                        ...(thoughtSignature ? { thoughtSignature } : {}),
                         functionResponse: {
                             id: toolMsg.tool_call_id,
                             name: toolMsg.name || 'unknown',
@@ -225,7 +237,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                 }
                 continue;
             }
-            contents.push(convertMessage(msg, { isClaudeModel, enableThinking, claudeToolsNeedingRequiredPlaceholder }));
+            contents.push(convertMessage(msg, { isClaudeModel, enableThinking, claudeToolsNeedingRequiredPlaceholder, userKey }));
         }
     }
 
@@ -293,11 +305,17 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
             sessionId: sessionId || generateSessionId(),
             // 禁用 Gemini 安全过滤，避免 "no candidates" 错误
             safetySettings: [
-                { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
-                { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
-                { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
-                { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
-                { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'OFF' }
+                { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_UNSPECIFIED', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_IMAGE_HATE', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_IMAGE_HARASSMENT', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+                { category: 'HARM_CATEGORY_JAILBREAK', threshold: 'BLOCK_NONE' }
             ]
         },
         model: actualModel,
@@ -338,15 +356,26 @@ function convertMessage(msg, ctx = {}) {
     const {
         isClaudeModel = false,
         enableThinking = false,
-        claudeToolsNeedingRequiredPlaceholder = null
+        claudeToolsNeedingRequiredPlaceholder = null,
+        userKey = null
     } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
     // tool result
     if (msg.role === 'tool') {
+        // 为 Claude thinking 模式添加 thoughtSignature，使上游能够继续交错思考
+        let thoughtSignature = null;
+        if (isClaudeModel && enableThinking) {
+            thoughtSignature = getCachedClaudeThinkingSignature(msg.tool_call_id);
+            if (!thoughtSignature && userKey) {
+                thoughtSignature = getCachedClaudeLastThinkingSignature(userKey);
+            }
+        }
+
         return {
             role: 'user',
             parts: [{
+                ...(thoughtSignature ? { thoughtSignature } : {}),
                 functionResponse: {
                     id: msg.tool_call_id,
                     name: msg.name || 'unknown',

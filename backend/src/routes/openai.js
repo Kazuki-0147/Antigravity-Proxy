@@ -21,8 +21,21 @@ export default async function openaiRoutes(fastify) {
         preHandler: verifyApiKey
     }, async (request, reply) => {
         const startTime = Date.now();
-        const openaiRequest = request.body;
+        let openaiRequest = request.body;
         const { stream = false, model } = openaiRequest;
+
+        // 兼容：部分客户端不会传 user 字段，但 Claude extended thinking 的 signature 回放/兜底逻辑需要一个稳定的 userKey。
+        // 统一用固定值作为 fallback。
+        try {
+            if (openaiRequest && typeof openaiRequest === 'object') {
+                if (!openaiRequest.user) {
+                    openaiRequest = { ...openaiRequest, user: 'api_key:static' };
+                }
+            }
+        } catch {
+            // ignore
+        }
+
         const includeUsageInStream = !!(
             stream &&
             openaiRequest &&
