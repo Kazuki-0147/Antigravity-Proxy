@@ -113,7 +113,7 @@ curl http://localhost:8088/v1beta/models/gemini-2.5-flash:generateContent \
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | 8088 | 服务端口 |
-| `ADMIN_PASSWORD` | admin123 | 管理面板密码 |
+| `ADMIN_PASSWORD` | - | 管理面板密码 |
 | `API_KEY` | - | API 访问密钥（客户端调用时需要提供） |
 
 ### 并发与重试配置
