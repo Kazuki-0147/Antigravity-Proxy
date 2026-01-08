@@ -7,6 +7,7 @@ import { convertTool, generateSessionId, parseDataUrl } from './schema-converter
 import { cacheClaudeToolThinking, cacheToolThoughtSignature, getCachedClaudeToolThinking, getCachedToolThoughtSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
 import { createToolOutputLimiter, limitToolOutput } from './tool-output-limiter.js';
+import { buildUpstreamSystemInstruction } from './system-instruction.js';
 
 // Defaults
 const DEFAULT_THINKING_BUDGET = 4096;
@@ -311,12 +312,10 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         requestType: 'agent'
     };
 
-    // systemInstruction
-    if (systemContent) {
-        request.request.systemInstruction = {
-            role: 'user',
-            parts: [{ text: systemContent }]
-        };
+    // systemInstruction: always prepend official prompt (upstream may validate it)
+    const upstreamSystemInstruction = buildUpstreamSystemInstruction(systemContent);
+    if (upstreamSystemInstruction) {
+        request.request.systemInstruction = upstreamSystemInstruction;
     }
 
     // tools

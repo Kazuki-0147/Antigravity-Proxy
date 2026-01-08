@@ -9,6 +9,7 @@ import { getMappedModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
 import { isCapacityError, SSE_HEADERS } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
+import { buildUpstreamSystemInstruction } from '../services/converter/system-instruction.js';
 
 function generateSessionId() {
     return String(-Math.floor(Math.random() * 9e18));
@@ -245,6 +246,17 @@ export default async function geminiRoutes(fastify) {
                 }
 
                 const requestType = model === 'gemini-3-pro-image' ? 'image_gen' : 'agent';
+
+                // Inject official system prompt (upstream may validate it)
+                // Skip for image generation model
+                if (requestType !== 'image_gen') {
+                    const upstreamSystemInstruction = buildUpstreamSystemInstruction(innerRequest.systemInstruction);
+                    if (upstreamSystemInstruction) {
+                        innerRequest.systemInstruction = upstreamSystemInstruction;
+                    } else {
+                        delete innerRequest.systemInstruction;
+                    }
+                }
 
                 const antigravityRequestBase = {
                     project: '',

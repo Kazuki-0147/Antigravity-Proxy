@@ -19,6 +19,14 @@ export const ANTIGRAVITY_CONFIG = {
     user_agent: 'antigravity/1.11.3 windows/amd64'
 };
 
+// Antigravity 官方系统提示词（上游可能会校验；可用 OFFICIAL_SYSTEM_PROMPT 覆盖）
+export const DEFAULT_OFFICIAL_SYSTEM_PROMPT =
+    'You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.' +
+    'You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.' +
+    '**Proactiveness**';
+
+export const OFFICIAL_SYSTEM_PROMPT = String(process.env.OFFICIAL_SYSTEM_PROMPT || DEFAULT_OFFICIAL_SYSTEM_PROMPT);
+
 // 服务器配置
 export const SERVER_CONFIG = {
     port: process.env.PORT || 3000,

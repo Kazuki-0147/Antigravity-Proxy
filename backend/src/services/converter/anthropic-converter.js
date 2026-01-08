@@ -7,6 +7,7 @@ import { convertJsonSchema, generateSessionId } from './schema-converter.js';
 import { cacheClaudeAssistantSignature, cacheClaudeLastThinkingSignature, cacheClaudeThinkingSignature, getCachedClaudeAssistantSignature, getCachedClaudeLastThinkingSignature, getCachedClaudeThinkingSignature, logThinkingDowngrade } from './signature-cache.js';
 import { extractThoughtSignatureFromCandidate, extractThoughtSignatureFromPart } from './thought-signature-extractor.js';
 import { createToolOutputLimiter, limitToolOutput } from './tool-output-limiter.js';
+import { buildUpstreamSystemInstruction } from './system-instruction.js';
 
 // Defaults
 const DEFAULT_THINKING_BUDGET = 4096;
@@ -202,22 +203,20 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         requestType: hasWebSearchTool ? 'web_search' : 'agent'
     };
 
-    // 添加系统指令
+    // 添加系统指令：始终注入官方系统提示词（上游可能会校验）
     const shouldAddInterleavedHint = isClaudeModel && thinkingEnabled && Array.isArray(tools) && tools.length > 0;
     const interleavedHint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.';
-    if (system || shouldAddInterleavedHint) {
-        let systemContent = typeof system === 'string'
-            ? system
-            : Array.isArray(system)
-                ? system.map(s => s.text || '').join('\n')
-                : '';
-        if (shouldAddInterleavedHint && !systemContent.includes(interleavedHint)) {
-            systemContent = systemContent ? `${systemContent}\n\n${interleavedHint}` : interleavedHint;
-        }
-        request.request.systemInstruction = {
-            role: 'user',
-            parts: [{ text: systemContent }]
-        };
+    let systemContent = typeof system === 'string'
+        ? system
+        : Array.isArray(system)
+            ? system.map(s => s.text || '').join('\n')
+            : '';
+    if (shouldAddInterleavedHint && !systemContent.includes(interleavedHint)) {
+        systemContent = systemContent ? `${systemContent}\n\n${interleavedHint}` : interleavedHint;
+    }
+    const upstreamSystemInstruction = buildUpstreamSystemInstruction(systemContent);
+    if (upstreamSystemInstruction) {
+        request.request.systemInstruction = upstreamSystemInstruction;
     }
 
     // 添加工具定义
