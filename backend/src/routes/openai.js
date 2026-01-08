@@ -12,7 +12,7 @@ import {
 import { createRequestLog } from '../db/index.js';
 import { isThinkingModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
-import { isCapacityError, SSE_HEADERS } from '../utils/route-helpers.js';
+import { isCapacityError, parseResetAfterMs, SSE_HEADERS } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry } from '../utils/request-handler.js';
 
 export default async function openaiRoutes(fastify) {
@@ -205,6 +205,9 @@ export default async function openaiRoutes(fastify) {
             errorMessage = error.message;
 
             const capacity = isCapacityError(error);
+            const retryAfterMs = Number.isFinite(error?.retryAfterMs)
+                ? error.retryAfterMs
+                : parseResetAfterMs(error?.message);
 
             // 容量耗尽：不把账号标成 error，只做短暂冷却，并返回 429
             if (account && capacity) {
@@ -218,11 +221,15 @@ export default async function openaiRoutes(fastify) {
             const errorCode = capacity ? 'rate_limit_exceeded' : 'internal_error';
 
             // 返回 OpenAI 格式的错误
+            if (capacity && Number.isFinite(retryAfterMs) && !reply.raw.headersSent) {
+                reply.header('Retry-After', Math.max(0, Math.ceil(retryAfterMs / 1000)));
+            }
             errorResponseForLog = {
                 error: {
                     message: error.message,
                     type: 'api_error',
-                    code: errorCode
+                    code: errorCode,
+                    ...(capacity && Number.isFinite(retryAfterMs) ? { retry_after_ms: retryAfterMs } : {})
                 }
             };
             return reply.code(httpStatus).send(errorResponseForLog);

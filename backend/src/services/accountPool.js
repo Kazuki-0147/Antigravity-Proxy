@@ -45,6 +45,9 @@ class AccountPool {
             throw new Error('No active accounts available');
         }
 
+        let earliestCooldownUntil = null;
+        let cooldownCount = 0;
+
         // 按配额降序、最后使用时间升序排序
         accounts.sort((a, b) => {
             // 首先按配额排序
@@ -67,6 +70,11 @@ class AccountPool {
 
             // 检查是否处于容量冷却期
             if (!DISABLE_LOCAL_LIMITS && model && this.isAccountInCooldown(account.id, model)) {
+                cooldownCount += 1;
+                const until = this.capacityCooldowns.get(`${account.id}:${model}`);
+                if (until && (!earliestCooldownUntil || until < earliestCooldownUntil)) {
+                    earliestCooldownUntil = until;
+                }
                 continue;
             }
 
@@ -86,6 +94,17 @@ class AccountPool {
             }
         }
 
+        // 所有账号都在冷却期：返回 429 + reset after，便于客户端等待后重试
+        if (!DISABLE_LOCAL_LIMITS && model && cooldownCount === accounts.length && earliestCooldownUntil) {
+            const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
+            const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+            const messageSeconds = Math.max(0, seconds - 1);
+            const err = new Error(`No capacity available, reset after ${messageSeconds}s`);
+            err.upstreamStatus = 429;
+            err.retryAfterMs = remainingMs;
+            throw err;
+        }
+
         throw new Error('No available accounts with valid tokens');
     }
 
@@ -98,6 +117,9 @@ class AccountPool {
         if (accounts.length === 0) {
             throw new Error('No active accounts available');
         }
+
+        let earliestCooldownUntil = null;
+        let cooldownCount = 0;
 
         // 严格轮询：稳定顺序（按 id），依次选择下一个可用账号
         const ordered = [...accounts].sort((a, b) => (a.id || 0) - (b.id || 0));
@@ -118,6 +140,11 @@ class AccountPool {
 
             // 检查是否处于容量冷却期
             if (!DISABLE_LOCAL_LIMITS && model && this.isAccountInCooldown(account.id, model)) {
+                cooldownCount += 1;
+                const until = this.capacityCooldowns.get(`${account.id}:${model}`);
+                if (until && (!earliestCooldownUntil || until < earliestCooldownUntil)) {
+                    earliestCooldownUntil = until;
+                }
                 idx = (idx + 1) % total;
                 continue;
             }
@@ -138,6 +165,17 @@ class AccountPool {
             }
 
             idx = (idx + 1) % total;
+        }
+
+        // 所有账号都在冷却期：返回 429 + reset after，便于客户端等待后重试
+        if (!DISABLE_LOCAL_LIMITS && model && cooldownCount === total && earliestCooldownUntil) {
+            const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
+            const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+            const messageSeconds = Math.max(0, seconds - 1);
+            const err = new Error(`No capacity available, reset after ${messageSeconds}s`);
+            err.upstreamStatus = 429;
+            err.retryAfterMs = remainingMs;
+            throw err;
         }
 
         throw new Error('No available accounts with valid tokens');
@@ -249,6 +287,7 @@ class AccountPool {
 
         const until = Date.now() + cooldownMs;
         this.capacityCooldowns.set(key, until);
+        return cooldownMs;
     }
 
     /**

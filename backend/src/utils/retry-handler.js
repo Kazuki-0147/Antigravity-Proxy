@@ -113,10 +113,8 @@ export async function withFullRetry({
                     : true;
 
                 if (canSwitch && shouldSwitch) {
-                    // 容量错误使用上游返回的延迟，其他错误使用固定延迟
-                    let delay = capacity
-                        ? (parseResetAfterMs(error?.message) ?? switchDelay)
-                        : switchDelay;
+                    // 切号时不需要等待当前账号的 reset 时间：直接换号更快（冷却由 accountPool 负责）
+                    let delay = switchDelay;
                     // 限制延迟不超过剩余超时时间
                     if (timeout > 0) {
                         const remaining = timeout - (Date.now() - startTime);

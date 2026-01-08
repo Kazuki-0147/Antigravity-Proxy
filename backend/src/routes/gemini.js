@@ -7,7 +7,7 @@ import { streamChat, chat, countTokens, fetchAvailableModels } from '../services
 import { createRequestLog } from '../db/index.js';
 import { getMappedModel } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
-import { isCapacityError, SSE_HEADERS } from '../utils/route-helpers.js';
+import { isCapacityError, parseResetAfterMs, SSE_HEADERS } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
 import { buildUpstreamSystemInstruction } from '../services/converter/system-instruction.js';
 
@@ -410,6 +410,9 @@ export default async function geminiRoutes(fastify) {
 
                 const msg = error.message || '';
                 const capacity = isCapacityError(error);
+                const retryAfterMs = Number.isFinite(error?.retryAfterMs)
+                    ? error.retryAfterMs
+                    : parseResetAfterMs(error?.message);
 
                 if (account && capacity) {
                     accountPool.markCapacityLimited(account.id, model, msg);
@@ -420,7 +423,17 @@ export default async function geminiRoutes(fastify) {
 
                 const httpStatus = capacity ? 429 : 500;
                 const errorCode = capacity ? 'rate_limit_exceeded' : 'internal_error';
-                errorResponseForLog = { error: { message: error.message, type: 'api_error', code: errorCode } };
+                if (capacity && Number.isFinite(retryAfterMs) && !reply.raw.headersSent) {
+                    reply.header('Retry-After', Math.max(0, Math.ceil(retryAfterMs / 1000)));
+                }
+                errorResponseForLog = {
+                    error: {
+                        message: error.message,
+                        type: 'api_error',
+                        code: errorCode,
+                        ...(capacity && Number.isFinite(retryAfterMs) ? { retry_after_ms: retryAfterMs } : {})
+                    }
+                };
                 return reply.code(httpStatus).send(errorResponseForLog);
             } finally {
                 if (modelSlotAcquired) releaseModelSlot(model);

@@ -1,8 +1,19 @@
-import { OAUTH_CONFIG, ANTIGRAVITY_CONFIG } from '../config.js';
-import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAccountProjectId, updateAccountTier, getActiveAccounts } from '../db/index.js';
+import { OAUTH_CONFIG, ANTIGRAVITY_CONFIG, AVAILABLE_MODELS, getMappedModel } from '../config.js';
+import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAccountProjectId, updateAccountTier, getAllAccountsForRefresh } from '../db/index.js';
 
 // Token 刷新提前时间（5分钟）
 const TOKEN_REFRESH_BUFFER = 5 * 60 * 1000;
+
+// Only consider models that this proxy actually exposes (mapped to upstream names).
+const QUOTA_RELEVANT_MODELS = new Set(AVAILABLE_MODELS.map((m) => getMappedModel(m.id)));
+
+function toQuotaFraction(value, fallback = 0) {
+    if (value === null || value === undefined) return fallback;
+    const num = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    // remainingFraction should be within [0, 1], clamp defensively
+    return Math.max(0, Math.min(1, num));
+}
 
 /**
  * 刷新账号的 access_token
@@ -130,10 +141,26 @@ export async function fetchQuotaInfo(account, model = null) {
         // 计算“总体配额”：取所有模型 quotaInfo.remainingFraction 的最小值
         let minQuota = 1;
         let minQuotaResetTime = null;
+        let sawQuotaSignal = false;
 
-        for (const modelInfo of Object.values(models)) {
-            if (!modelInfo?.quotaInfo) continue;
-            const remainingFraction = modelInfo.quotaInfo.remainingFraction ?? 1;
+        const relevantEntries = Object.entries(models).filter(([modelId]) => QUOTA_RELEVANT_MODELS.has(modelId));
+        const entriesToScan = relevantEntries.length > 0 ? relevantEntries : Object.entries(models);
+
+        for (const [modelId, modelInfo] of entriesToScan) {
+            if (!modelInfo) continue;
+
+            // If the model is relevant but quotaInfo is missing, treat as 0 to avoid "phantom 100%".
+            if (!modelInfo.quotaInfo) {
+                if (QUOTA_RELEVANT_MODELS.has(modelId)) {
+                    sawQuotaSignal = true;
+                    minQuota = 0;
+                    minQuotaResetTime = null;
+                }
+                continue;
+            }
+
+            sawQuotaSignal = true;
+            const remainingFraction = toQuotaFraction(modelInfo.quotaInfo.remainingFraction, 0);
             const resetTimestamp = modelInfo.quotaInfo.resetTime ? new Date(modelInfo.quotaInfo.resetTime).getTime() : null;
 
             if (remainingFraction < minQuota) {
@@ -148,10 +175,18 @@ export async function fetchQuotaInfo(account, model = null) {
             const selectedInfo = models?.[model];
             if (selectedInfo?.quotaInfo) {
                 selected = {
-                    remainingFraction: selectedInfo.quotaInfo.remainingFraction ?? 1,
+                    remainingFraction: toQuotaFraction(selectedInfo.quotaInfo.remainingFraction, 0),
                     resetTime: selectedInfo.quotaInfo.resetTime ? new Date(selectedInfo.quotaInfo.resetTime).getTime() : null
                 };
+            } else if (selectedInfo && QUOTA_RELEVANT_MODELS.has(model)) {
+                selected = { remainingFraction: 0, resetTime: null };
             }
+        }
+
+        // 如果上游没有返回任何 quotaInfo，避免把默认值 1 误写进 DB
+        if (!sawQuotaSignal) {
+            minQuota = 0;
+            minQuotaResetTime = null;
         }
 
         updateAccountQuota(account.id, minQuota, minQuotaResetTime);
@@ -193,24 +228,54 @@ export async function fetchDetailedQuotaInfo(account) {
         const quotas = {};
         let minQuota = 1;
         let minQuotaResetTime = null;
+        let sawQuotaSignal = false;
+        const hasAnyRelevantModel = Object.keys(models).some((modelId) => QUOTA_RELEVANT_MODELS.has(modelId));
 
         for (const [modelId, modelInfo] of Object.entries(models)) {
-            if (modelInfo.quotaInfo) {
-                const { remainingFraction, resetTime } = modelInfo.quotaInfo;
-                const resetTimestamp = resetTime ? new Date(resetTime).getTime() : null;
+            if (!modelInfo) continue;
 
-                quotas[modelId] = {
-                    remainingFraction: remainingFraction ?? 1,
-                    resetTime: resetTimestamp,
-                    displayName: modelInfo.displayName || modelId
-                };
+            const isRelevant = QUOTA_RELEVANT_MODELS.has(modelId);
+            const shouldAffectOverall = !hasAnyRelevantModel || isRelevant;
 
-                // 跟踪最小配额用于更新账号总体配额
-                if (remainingFraction !== undefined && remainingFraction < minQuota) {
-                    minQuota = remainingFraction;
-                    minQuotaResetTime = resetTimestamp;
+            if (!modelInfo.quotaInfo) {
+                // For relevant models, missing quotaInfo should not be treated as "full".
+                if (isRelevant) {
+                    sawQuotaSignal = true;
+                    quotas[modelId] = {
+                        remainingFraction: 0,
+                        resetTime: null,
+                        displayName: modelInfo.displayName || modelId
+                    };
+
+                    if (shouldAffectOverall) {
+                        minQuota = 0;
+                        minQuotaResetTime = null;
+                    }
                 }
+                continue;
             }
+
+            sawQuotaSignal = true;
+            const { remainingFraction: rawRemainingFraction, resetTime } = modelInfo.quotaInfo;
+            const remainingFraction = toQuotaFraction(rawRemainingFraction, 0);
+            const resetTimestamp = resetTime ? new Date(resetTime).getTime() : null;
+
+            quotas[modelId] = {
+                remainingFraction,
+                resetTime: resetTimestamp,
+                displayName: modelInfo.displayName || modelId
+            };
+
+            // 跟踪最小配额用于更新账号总体配额
+            if (shouldAffectOverall && remainingFraction < minQuota) {
+                minQuota = remainingFraction;
+                minQuotaResetTime = resetTimestamp;
+            }
+        }
+
+        if (!sawQuotaSignal) {
+            minQuota = 0;
+            minQuotaResetTime = null;
         }
 
         // 更新账号的总体配额（使用最小值）
@@ -255,7 +320,7 @@ export async function initializeAccount(account) {
 export function startTokenRefreshScheduler(intervalMs = 50 * 60 * 1000) {
     const refresh = async () => {
         try {
-            const accounts = getActiveAccounts();
+            const accounts = getAllAccountsForRefresh();
             const now = Date.now();
 
             for (const account of accounts) {
@@ -286,7 +351,7 @@ export function startTokenRefreshScheduler(intervalMs = 50 * 60 * 1000) {
 export function startQuotaSyncScheduler(intervalMs = 10 * 60 * 1000) {
     const sync = async () => {
         try {
-            const accounts = getActiveAccounts();
+            const accounts = getAllAccountsForRefresh();
 
             for (const account of accounts) {
                 try {

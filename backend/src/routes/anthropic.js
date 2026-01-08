@@ -11,7 +11,7 @@ import {
 import { createRequestLog } from '../db/index.js';
 import { isThinkingModel, AVAILABLE_MODELS } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
-import { isCapacityError, SSE_HEADERS_ANTHROPIC } from '../utils/route-helpers.js';
+import { isCapacityError, parseResetAfterMs, SSE_HEADERS_ANTHROPIC } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry } from '../utils/request-handler.js';
 
 export default async function anthropicRoutes(fastify) {
@@ -251,23 +251,32 @@ export default async function anthropicRoutes(fastify) {
             status = 'error';
             errorMessage = error.message;
 
+            const capacity = isCapacityError(error);
+            const retryAfterMs = Number.isFinite(error?.retryAfterMs)
+                ? error.retryAfterMs
+                : parseResetAfterMs(error?.message);
+
             // 容量耗尽：不把账号标成 error，只做短暂冷却，并返回 429
-            if (account && isCapacityError(error)) {
+            if (account && capacity) {
                 accountPool.markCapacityLimited(account.id, model, error.message || '');
             } else if (account) {
                 // 非容量错误：累计错误计数，达到阈值才禁用
                 accountPool.markAccountError(account.id, error);
             }
 
-            const httpStatus = isCapacityError(error) ? 429 : 500;
-            const errorType = isCapacityError(error) ? 'rate_limit_error' : 'api_error';
+            const httpStatus = capacity ? 429 : 500;
+            const errorType = capacity ? 'rate_limit_error' : 'api_error';
 
             // 返回 Anthropic 格式的错误
+            if (capacity && Number.isFinite(retryAfterMs) && !reply.raw.headersSent) {
+                reply.header('Retry-After', Math.max(0, Math.ceil(retryAfterMs / 1000)));
+            }
             errorResponseForLog = {
                 type: 'error',
                 error: {
                     type: errorType,
-                    message: error.message
+                    message: error.message,
+                    ...(capacity && Number.isFinite(retryAfterMs) ? { retry_after_ms: retryAfterMs } : {})
                 }
             };
             return reply.code(httpStatus).send(errorResponseForLog);

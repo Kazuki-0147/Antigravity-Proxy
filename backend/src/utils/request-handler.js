@@ -46,7 +46,10 @@ export async function runChatWithCapacityRetry({
             }
         },
         onCapacityError: async ({ account, error }) => {
-            accountPool.markCapacityLimited(account.id, model, error.message || '');
+            const cooldownMs = accountPool.markCapacityLimited(account.id, model, error.message || '');
+            if (cooldownMs !== undefined && error && typeof error === 'object' && !Number.isFinite(error.retryAfterMs)) {
+                error.retryAfterMs = cooldownMs;
+            }
             accountPool.unlockAccount(account.id);
         }
     });
@@ -81,9 +84,22 @@ export async function runChatWithFullRetry({
             const antigravityRequest = buildRequest(account);
             return await execute(account, antigravityRequest);
         },
+        shouldRetryOnSameAccount: ({ capacity }) => {
+            // 容量/配额类错误同号重试意义不大：直接切号更快
+            if (capacity) return false;
+            return true;
+        },
+        shouldSwitchAccount: ({ capacity }) => {
+            // 单账号场景：不要切号重试，直接返回 429（并透传 reset after）
+            if (capacity && availableCount <= 1) return false;
+            return true;
+        },
         onError: async ({ account, error, capacity }) => {
             if (capacity) {
-                accountPool.markCapacityLimited(account.id, model, error.message || '');
+                const cooldownMs = accountPool.markCapacityLimited(account.id, model, error.message || '');
+                if (cooldownMs !== undefined && error && typeof error === 'object' && !Number.isFinite(error.retryAfterMs)) {
+                    error.retryAfterMs = cooldownMs;
+                }
             }
             accountPool.unlockAccount(account.id);
         },
@@ -130,7 +146,10 @@ export async function runStreamChatWithCapacityRetry({
 
             const capacity = isCapacityError(error);
             if (capacity) {
-                accountPool.markCapacityLimited(account.id, model, error.message || '');
+                const cooldownMs = accountPool.markCapacityLimited(account.id, model, error.message || '');
+                if (cooldownMs !== undefined && error && typeof error === 'object' && !Number.isFinite(error.retryAfterMs)) {
+                    error.retryAfterMs = cooldownMs;
+                }
                 accountPool.unlockAccount(account.id);
 
                 const allowByOutput = typeof canRetry === 'function' ? !!canRetry({ attempt, error }) : true;
@@ -190,7 +209,10 @@ export async function runStreamChatWithFullRetry({
                     return;
                 }
                 if (capacity) {
-                    accountPool.markCapacityLimited(account.id, model, error.message || '');
+                    const cooldownMs = accountPool.markCapacityLimited(account.id, model, error.message || '');
+                    if (cooldownMs !== undefined && error && typeof error === 'object' && !Number.isFinite(error.retryAfterMs)) {
+                        error.retryAfterMs = cooldownMs;
+                    }
                 }
                 accountPool.unlockAccount(account.id);
             },
@@ -203,13 +225,16 @@ export async function runStreamChatWithFullRetry({
                 if (abortSignal?.aborted) return false;
                 // 不可重试错误不再同号重试（会在 withFullRetry 中直接抛出）
                 if (isNonRetryableError(error)) return false;
-                // 所有其他错误都可以同号重试（包括429，会等待冷却时间）
+                // 容量/配额类错误直接切号，冷却由 accountPool 负责
+                if (capacity) return false;
                 return true;
             },
             shouldSwitchAccount: ({ error, capacity }) => {
                 if (abortSignal?.aborted) return false;
                 // 不可重试错误不换号（会在 withFullRetry 中直接抛出）
                 if (isNonRetryableError(error)) return false;
+                // 单账号场景：不要切号重试，直接返回 429（并透传 reset after）
+                if (capacity && availableCount <= 1) return false;
                 if (typeof canRetry === 'function' && !canRetry({ error })) return false;
                 return true;
             }
