@@ -1,5 +1,5 @@
 import { OAUTH_CONFIG, ANTIGRAVITY_CONFIG, AVAILABLE_MODELS, getMappedModel } from '../config.js';
-import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAccountProjectId, updateAccountTier, getAllAccountsForRefresh } from '../db/index.js';
+import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAccountProjectId, updateAccountTier, getAllAccountsForRefresh, upsertAccountModelQuota } from '../db/index.js';
 
 // Token 刷新提前时间（5分钟）
 const TOKEN_REFRESH_BUFFER = 5 * 60 * 1000;
@@ -153,6 +153,7 @@ export async function fetchQuotaInfo(account, model = null) {
             if (!modelInfo.quotaInfo) {
                 if (QUOTA_RELEVANT_MODELS.has(modelId)) {
                     sawQuotaSignal = true;
+                    upsertAccountModelQuota(account.id, modelId, 0, null);
                     minQuota = 0;
                     minQuotaResetTime = null;
                 }
@@ -162,6 +163,10 @@ export async function fetchQuotaInfo(account, model = null) {
             sawQuotaSignal = true;
             const remainingFraction = toQuotaFraction(modelInfo.quotaInfo.remainingFraction, 0);
             const resetTimestamp = modelInfo.quotaInfo.resetTime ? new Date(modelInfo.quotaInfo.resetTime).getTime() : null;
+
+            if (QUOTA_RELEVANT_MODELS.has(modelId)) {
+                upsertAccountModelQuota(account.id, modelId, remainingFraction, resetTimestamp);
+            }
 
             if (remainingFraction < minQuota) {
                 minQuota = remainingFraction;
@@ -241,6 +246,7 @@ export async function fetchDetailedQuotaInfo(account) {
                 // For relevant models, missing quotaInfo should not be treated as "full".
                 if (isRelevant) {
                     sawQuotaSignal = true;
+                    upsertAccountModelQuota(account.id, modelId, 0, null);
                     quotas[modelId] = {
                         remainingFraction: 0,
                         resetTime: null,
@@ -259,6 +265,10 @@ export async function fetchDetailedQuotaInfo(account) {
             const { remainingFraction: rawRemainingFraction, resetTime } = modelInfo.quotaInfo;
             const remainingFraction = toQuotaFraction(rawRemainingFraction, 0);
             const resetTimestamp = resetTime ? new Date(resetTime).getTime() : null;
+
+            if (isRelevant) {
+                upsertAccountModelQuota(account.id, modelId, remainingFraction, resetTimestamp);
+            }
 
             quotas[modelId] = {
                 remainingFraction,
@@ -366,6 +376,9 @@ export function startQuotaSyncScheduler(intervalMs = 10 * 60 * 1000) {
             // ignore (status is stored in DB)
         }
     };
+
+    // 立即执行一次（不 await，避免阻塞启动）
+    sync();
 
     // 设置定时任务
     return setInterval(sync, intervalMs);

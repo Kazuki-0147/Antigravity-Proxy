@@ -1,6 +1,6 @@
 import { getActiveAccounts, updateAccountLastUsed, updateAccountStatus, updateAccountQuota } from '../db/index.js';
 import { ensureValidToken, fetchQuotaInfo } from './tokenManager.js';
-import { RETRY_CONFIG } from '../config.js';
+import { RETRY_CONFIG, getMappedModel } from '../config.js';
 
 function parseBoolean(value, defaultValue = false) {
     if (value === undefined || value === null || value === '') return defaultValue;
@@ -39,7 +39,8 @@ class AccountPool {
      * 3. 如果配额相同，选择最近最少使用的账号
      */
     async getBestAccount(model = null) {
-        const accounts = getActiveAccounts();
+        const mappedModel = model ? getMappedModel(model) : null;
+        const accounts = getActiveAccounts(mappedModel);
 
         if (accounts.length === 0) {
             throw new Error('No active accounts available');
@@ -69,9 +70,9 @@ class AccountPool {
             }
 
             // 检查是否处于容量冷却期
-            if (!DISABLE_LOCAL_LIMITS && model && this.isAccountInCooldown(account.id, model)) {
+            if (!DISABLE_LOCAL_LIMITS && mappedModel && this.isAccountInCooldown(account.id, mappedModel)) {
                 cooldownCount += 1;
-                const until = this.capacityCooldowns.get(`${account.id}:${model}`);
+                const until = this.capacityCooldowns.get(`${account.id}:${mappedModel}`);
                 if (until && (!earliestCooldownUntil || until < earliestCooldownUntil)) {
                     earliestCooldownUntil = until;
                 }
@@ -95,7 +96,7 @@ class AccountPool {
         }
 
         // 所有账号都在冷却期：返回 429 + reset after，便于客户端等待后重试
-        if (!DISABLE_LOCAL_LIMITS && model && cooldownCount === accounts.length && earliestCooldownUntil) {
+        if (!DISABLE_LOCAL_LIMITS && mappedModel && cooldownCount === accounts.length && earliestCooldownUntil) {
             const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
             const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
             const messageSeconds = Math.max(0, seconds - 1);
@@ -112,7 +113,8 @@ class AccountPool {
      * 轮询获取账号（简单轮询，不考虑配额）
      */
     async getNextAccount(model = null) {
-        const accounts = getActiveAccounts();
+        const mappedModel = model ? getMappedModel(model) : null;
+        const accounts = getActiveAccounts(mappedModel);
 
         if (accounts.length === 0) {
             throw new Error('No active accounts available');
@@ -139,9 +141,9 @@ class AccountPool {
             }
 
             // 检查是否处于容量冷却期
-            if (!DISABLE_LOCAL_LIMITS && model && this.isAccountInCooldown(account.id, model)) {
+            if (!DISABLE_LOCAL_LIMITS && mappedModel && this.isAccountInCooldown(account.id, mappedModel)) {
                 cooldownCount += 1;
-                const until = this.capacityCooldowns.get(`${account.id}:${model}`);
+                const until = this.capacityCooldowns.get(`${account.id}:${mappedModel}`);
                 if (until && (!earliestCooldownUntil || until < earliestCooldownUntil)) {
                     earliestCooldownUntil = until;
                 }
@@ -168,7 +170,7 @@ class AccountPool {
         }
 
         // 所有账号都在冷却期：返回 429 + reset after，便于客户端等待后重试
-        if (!DISABLE_LOCAL_LIMITS && model && cooldownCount === total && earliestCooldownUntil) {
+        if (!DISABLE_LOCAL_LIMITS && mappedModel && cooldownCount === total && earliestCooldownUntil) {
             const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
             const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
             const messageSeconds = Math.max(0, seconds - 1);
@@ -259,10 +261,11 @@ class AccountPool {
      */
     markCapacityLimited(accountId, model, message) {
         if (DISABLE_LOCAL_LIMITS) return;
-        if (!accountId || !model) return;
+        const mappedModel = model ? getMappedModel(model) : null;
+        if (!accountId || !mappedModel) return;
 
         let cooldownMs = CAPACITY_COOLDOWN_DEFAULT_MS;
-        const key = `${accountId}:${model}`;
+        const key = `${accountId}:${mappedModel}`;
         const prev = this.capacityErrorCounts.get(key) || 0;
         const next = prev + 1;
         this.capacityErrorCounts.set(key, next);
@@ -295,8 +298,9 @@ class AccountPool {
      */
     markCapacityRecovered(accountId, model) {
         if (DISABLE_LOCAL_LIMITS) return;
-        if (!accountId || !model) return;
-        const key = `${accountId}:${model}`;
+        const mappedModel = model ? getMappedModel(model) : null;
+        if (!accountId || !mappedModel) return;
+        const key = `${accountId}:${mappedModel}`;
         this.capacityErrorCounts.delete(key);
     }
 
@@ -305,8 +309,9 @@ class AccountPool {
      */
     isAccountInCooldown(accountId, model) {
         if (DISABLE_LOCAL_LIMITS) return false;
-        if (!accountId || !model) return false;
-        const key = `${accountId}:${model}`;
+        const mappedModel = model ? getMappedModel(model) : null;
+        if (!accountId || !mappedModel) return false;
+        const key = `${accountId}:${mappedModel}`;
         const until = this.capacityCooldowns.get(key);
         if (!until) return false;
 
@@ -337,8 +342,9 @@ class AccountPool {
     /**
      * 获取当前可用账号数量（active 且 quota > 0）
      */
-    getAvailableAccountCount() {
-        const accounts = getActiveAccounts();
+    getAvailableAccountCount(model = null) {
+        const mappedModel = model ? getMappedModel(model) : null;
+        const accounts = getActiveAccounts(mappedModel);
         return accounts.length;
     }
 

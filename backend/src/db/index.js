@@ -47,12 +47,54 @@ export function getAllAccountsForRefresh() {
     `).all();
 }
 
-export function getActiveAccounts() {
+// 兼容：按模型选择可用账号（同一账号不同模型配额可能不同）
+export function getActiveAccounts(model = null) {
+    if (model) {
+        return getDatabase().prepare(`
+            SELECT
+                a.id,
+                a.email,
+                a.refresh_token,
+                a.access_token,
+                a.token_expires_at,
+                a.project_id,
+                a.tier,
+                a.status,
+                COALESCE(q.quota_remaining, a.quota_remaining) AS quota_remaining,
+                COALESCE(q.quota_reset_time, a.quota_reset_time) AS quota_reset_time,
+                a.last_used_at,
+                a.error_count,
+                a.last_error,
+                a.created_at
+            FROM accounts a
+            LEFT JOIN account_model_quotas q
+                ON q.account_id = a.id AND q.model = ?
+            WHERE a.status = 'active'
+                AND (q.quota_remaining IS NULL OR q.quota_remaining > 0)
+            ORDER BY
+                CASE WHEN q.quota_remaining IS NULL THEN 1 ELSE 0 END ASC,
+                COALESCE(q.quota_remaining, a.quota_remaining) DESC,
+                a.last_used_at ASC
+        `).all(model);
+    }
+
     return getDatabase().prepare(`
         SELECT * FROM accounts
         WHERE status = 'active' AND quota_remaining > 0
         ORDER BY quota_remaining DESC, last_used_at ASC
     `).all();
+}
+
+export function upsertAccountModelQuota(accountId, model, quotaRemaining, quotaResetTime) {
+    if (!accountId || !model) return;
+    getDatabase().prepare(`
+        INSERT INTO account_model_quotas (account_id, model, quota_remaining, quota_reset_time, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(account_id, model) DO UPDATE SET
+            quota_remaining = excluded.quota_remaining,
+            quota_reset_time = excluded.quota_reset_time,
+            updated_at = excluded.updated_at
+    `).run(accountId, model, quotaRemaining, quotaResetTime, Date.now());
 }
 
 export function getAccountById(id) {

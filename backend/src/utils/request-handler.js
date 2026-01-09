@@ -27,7 +27,7 @@ export async function runChatWithCapacityRetry({
 }) {
     const configuredRetries = Math.max(0, Number(maxRetries || 0));
     const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
-        ? accountPool.getAvailableAccountCount()
+        ? accountPool.getAvailableAccountCount(model)
         : 0;
     // 至少轮询完一遍账号池（遇到 capacity 时再放弃）
     const effectiveMaxRetries = Math.max(configuredRetries, Math.max(0, availableCount - 1));
@@ -68,7 +68,7 @@ export async function runChatWithFullRetry({
     execute
 }) {
     const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
-        ? accountPool.getAvailableAccountCount()
+        ? accountPool.getAvailableAccountCount(model)
         : 0;
     // 换号次数：配置值或账号池大小-1，取较大者
     const maxAccountSwitches = Math.max(RETRY_CONFIG.maxRetries, Math.max(0, availableCount - 1));
@@ -126,7 +126,7 @@ export async function runStreamChatWithCapacityRetry({
     let attempt = 0;
     const configuredRetries = Math.max(0, Number(maxRetries || 0));
     const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
-        ? accountPool.getAvailableAccountCount()
+        ? accountPool.getAvailableAccountCount(model)
         : 0;
     const effectiveMaxRetries = Math.max(configuredRetries, Math.max(0, availableCount - 1));
 
@@ -182,7 +182,7 @@ export async function runStreamChatWithFullRetry({
     canRetry
 }) {
     const availableCount = typeof accountPool?.getAvailableAccountCount === 'function'
-        ? accountPool.getAvailableAccountCount()
+        ? accountPool.getAvailableAccountCount(model)
         : 0;
     const maxAccountSwitches = Math.max(RETRY_CONFIG.maxRetries, Math.max(0, availableCount - 1));
 
