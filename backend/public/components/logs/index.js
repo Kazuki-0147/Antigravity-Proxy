@@ -146,26 +146,26 @@ export class LogsPage extends Component {
 
       return `
         <tr>
-          <td class="mono" data-label="时间" style="font-size:11px;white-space:nowrap">
+          <td class="mono" data-label="时间" style="font-size:13px;white-space:nowrap">
             ${formatTime(l.created_at)}
           </td>
-          <td class="mono" data-label="请求ID" style="font-size:11px;white-space:nowrap">
+          <td class="mono" data-label="请求ID" style="font-size:12px">
             ${this._escape(rid)}
           </td>
-          <td class="mono" data-label="尝试" style="font-size:11px;white-space:nowrap">
+          <td class="mono" data-label="尝试" style="font-size:13px;white-space:nowrap">
             ${this._escape(attemptLabel)}
           </td>
-          <td class="mono" data-label="模型" style="font-size:12px">${this._escape(l.model)}</td>
-          <td data-label="账号" style="font-size:12px">${this._escape(l.account_email || '-')}</td>
+          <td class="mono" data-label="模型" style="font-size:14px;word-break:break-all;min-width:120px">${this._escape(l.model)}</td>
+          <td data-label="账号" style="font-size:13px">${this._escape(l.account_email || '-')}</td>
           <td data-label="状态">
             <span class="badge ${isError ? 'badge-danger' : 'badge-success'}">
               ${isError ? '失败' : '成功'}
             </span>
           </td>
           <td class="mono" data-label="延迟">${l.latency_ms}ms</td>
-          <td class="error-cell" data-label="错误信息">
+          <td data-label="错误信息">
             ${errorMsg
-              ? `<span class="error-text">${this._escape(errorMsg)}</span><div class="error-tooltip" role="tooltip">${this._escape(errorMsg)}</div>`
+              ? `<span class="error-text">${this._escape(errorMsg)}</span>`
               : '<span class="text-secondary">-</span>'
             }
           </td>

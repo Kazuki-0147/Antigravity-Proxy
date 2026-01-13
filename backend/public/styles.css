@@ -794,48 +794,15 @@ body {
   white-space: nowrap;
 }
 
-/* 错误信息可展开 */
-.error-cell {
-  position: relative;
-}
-
+/* 错误信息直接显示 */
 .error-text {
   display: block;
-  max-width: 280px;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--color-danger);
   cursor: text;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.error-tooltip {
-  position: absolute;
-  left: 0;
-  top: 0;
-  background: var(--color-surface-elevated);
-  padding: 10px 14px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--color-border);
-  box-shadow: var(--shadow-md);
-  z-index: 100;
-  max-width: 400px;
-  min-width: 280px;
   white-space: pre-wrap;
   word-break: break-word;
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  user-select: text;
-  cursor: text;
-}
-
-.error-cell:hover .error-tooltip,
-.error-cell:focus-within .error-tooltip {
-  opacity: 1;
-  visibility: visible;
-  pointer-events: auto;
+  line-height: 1.5;
 }
 
 /* === API 端点展示 === */
