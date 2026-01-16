@@ -110,46 +110,64 @@ export async function ensureValidToken(account) {
 
 /**
  * 通过 onboardUser 端点注册用户并获取 projectId（适用于从未登录过 Antigravity 的用户）
+ * 会先尝试 standard-tier，失败后尝试 free-tier
  */
 async function onboardUser(account) {
-    const response = await fetch('https://cloudcode-pa.googleapis.com/v1internal:onboardUser', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${account.access_token}`,
-            'Content-Type': 'application/json',
-            'User-Agent': ANTIGRAVITY_CONFIG.user_agent
-        },
-        body: JSON.stringify({
-            tierId: 'standard-tier',
-            metadata: {
-                ideType: 'ANTIGRAVITY',
-                platform: 'PLATFORM_UNSPECIFIED',
-                pluginType: 'GEMINI'
+    const tiers = ['standard-tier', 'free-tier'];
+    let lastError = null;
+
+    for (const tierId of tiers) {
+        try {
+            const response = await fetch('https://cloudcode-pa.googleapis.com/v1internal:onboardUser', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${account.access_token}`,
+                    'Content-Type': 'application/json',
+                    'User-Agent': ANTIGRAVITY_CONFIG.user_agent
+                },
+                body: JSON.stringify({
+                    tierId: tierId,
+                    metadata: {
+                        ideType: 'ANTIGRAVITY',
+                        platform: 'PLATFORM_UNSPECIFIED',
+                        pluginType: 'GEMINI'
+                    }
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                lastError = new Error(errorData.error?.message || `Failed to onboard user: ${response.status}`);
+                continue; // 尝试下一个 tier
             }
-        })
-    });
 
-    if (!response.ok) {
-        throw new Error(`Failed to onboard user: ${response.status}`);
+            const data = await response.json();
+
+            if (!data.done) {
+                lastError = new Error('Onboard operation not completed');
+                continue;
+            }
+
+            const projectInfo = data.response?.cloudaicompanionProject;
+            if (!projectInfo?.id) {
+                lastError = new Error('No project ID in onboard response');
+                continue;
+            }
+
+            return {
+                projectId: projectInfo.id,
+                projectName: projectInfo.name,
+                projectNumber: projectInfo.projectNumber,
+                tierId: tierId
+            };
+        } catch (error) {
+            lastError = error;
+            continue;
+        }
     }
 
-    const data = await response.json();
-
-    // 检查操作是否完成
-    if (!data.done) {
-        throw new Error('Onboard operation not completed');
-    }
-
-    const projectInfo = data.response?.cloudaicompanionProject;
-    if (!projectInfo?.id) {
-        throw new Error('No project ID in onboard response');
-    }
-
-    return {
-        projectId: projectInfo.id,
-        projectName: projectInfo.name,
-        projectNumber: projectInfo.projectNumber
-    };
+    // 所有 tier 都失败了
+    throw lastError || new Error('Failed to onboard user with all tiers');
 }
 
 /**
