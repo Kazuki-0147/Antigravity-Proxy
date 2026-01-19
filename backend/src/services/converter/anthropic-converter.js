@@ -1686,10 +1686,23 @@ export function preprocessAnthropicRequest(request) {
             return localMutate ? { ...msg, content: blocks } : msg;
         }
 
-        // 1b) 含 tool_use 但没有 thinking 块：不注入签名
-        // 上游当时没下发 thinking，回放时也不需要 thinking 块
+        // 1b) 含 tool_use 但没有 thinking 块：
+        // 这种情况通常是客户端（如 Cherry Studio）没有保存 thinking 块，但上游当时确实下发了 thinking。
+        // Claude API 要求：当 thinking 启用时，包含 tool_use 的 assistant 消息必须以 thinking/redacted_thinking 开头。
+        // 因此需要从缓存恢复 signature 并注入 redacted_thinking 块。
         if (hasToolUse && firstThinkingIndex < 0) {
-            // 直接返回，不做任何修改
+            const signature = recoverSignature();
+            if (signature) {
+                // 有缓存的 signature，注入 redacted_thinking 块
+                blocks.unshift({ type: 'redacted_thinking', signature });
+                didMutate = true;
+                return { ...msg, content: blocks };
+            }
+            // 没有缓存的 signature，需要降级禁用 thinking
+            mustDisableThinking = true;
+            for (const id of toolUseIds) {
+                if (id) missingToolUseIdsForSignature.push(String(id));
+            }
             return msg;
         }
 
