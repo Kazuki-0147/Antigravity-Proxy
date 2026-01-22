@@ -48,8 +48,6 @@ services:
       - MAX_CONCURRENT_PER_MODEL=0
       # 每个账号的最大并发请求数（0=不限制）
       - MAX_CONCURRENT_PER_ACCOUNT=0
-      # 上游容量错误（429）切号重试次数
-      - UPSTREAM_CAPACITY_RETRIES=2
       # 上游容量错误重试延迟（毫秒）
       - UPSTREAM_CAPACITY_RETRY_DELAY_MS=1000
       # 同号重试次数（非容量错误时，在换号前先重试几次）

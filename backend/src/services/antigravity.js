@@ -34,6 +34,16 @@ const UPSTREAM_SSE_CAPTURE_ENABLED = (() => {
 })();
 const UPSTREAM_SSE_CAPTURE_PATH = process.env.UPSTREAM_SSE_CAPTURE_PATH || '/app/data/upstream_sse.log';
 
+function looksLikeGoogleAutomatedQueriesBlock(html) {
+    const s = String(html || '');
+    if (!s) return false;
+    // Typical Google "Sorry..." HTML block page (bot detection / CAPTCHA required).
+    return (
+        s.includes('<title>Sorry...</title>') &&
+        (s.includes('sending automated queries') || s.includes('support.google.com/websearch/answer/86640'))
+    );
+}
+
 function captureUpstreamRequest(kind, url, request) {
     if (!UPSTREAM_REQUEST_CAPTURE_ENABLED) return;
     if (!request || typeof request !== 'object') return;
@@ -103,7 +113,14 @@ export async function streamChat(account, request, onData, onError, signal = nul
                 parsed = errorJson;
                 errorMessage = errorJson.error?.message || errorMessage;
             } catch {
-                errorMessage = errorText || errorMessage;
+                if (looksLikeGoogleAutomatedQueriesBlock(errorText)) {
+                    errorMessage = `Upstream blocked automated requests (Google "Sorry" page). ` +
+                        `This is usually triggered by your outbound IP / network being flagged or rate-limited. ` +
+                        `Try waiting, reducing request rate, or configuring OUTBOUND_PROXY/HTTP_PROXY. ` +
+                        `Upstream status: ${response.status}.`;
+                } else {
+                    errorMessage = errorText || errorMessage;
+                }
             }
 
             const err = new Error(errorMessage);
@@ -367,7 +384,14 @@ export async function chat(account, request) {
             parsed = errorJson;
             errorMessage = errorJson.error?.message || errorMessage;
         } catch {
-            errorMessage = errorText || errorMessage;
+            if (looksLikeGoogleAutomatedQueriesBlock(errorText)) {
+                errorMessage = `Upstream blocked automated requests (Google "Sorry" page). ` +
+                    `This is usually triggered by your outbound IP / network being flagged or rate-limited. ` +
+                    `Try waiting, reducing request rate, or configuring OUTBOUND_PROXY/HTTP_PROXY. ` +
+                    `Upstream status: ${response.status}.`;
+            } else {
+                errorMessage = errorText || errorMessage;
+            }
         }
 
         const err = new Error(errorMessage);
@@ -419,7 +443,14 @@ export async function countTokens(account, request) {
             parsed = errorJson;
             errorMessage = errorJson.error?.message || errorMessage;
         } catch {
-            errorMessage = errorText || errorMessage;
+            if (looksLikeGoogleAutomatedQueriesBlock(errorText)) {
+                errorMessage = `Upstream blocked automated requests (Google "Sorry" page). ` +
+                    `This is usually triggered by your outbound IP / network being flagged or rate-limited. ` +
+                    `Try waiting, reducing request rate, or configuring OUTBOUND_PROXY/HTTP_PROXY. ` +
+                    `Upstream status: ${response.status}.`;
+            } else {
+                errorMessage = errorText || errorMessage;
+            }
         }
 
         const err = new Error(errorMessage);

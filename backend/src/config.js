@@ -123,9 +123,8 @@ export function getMappedModel(model) {
 // 注意：部分配置此前是在请求处理时读取 env（支持运行期调整）。
 // 为保持行为一致，这里使用 getter 读取 process.env。
 export const RETRY_CONFIG = Object.freeze({
-    get maxRetries() {
-        return Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRIES || 2));
-    },
+    // countTokens 请求的切号重试次数（硬编码，无需配置）
+    maxRetries: 2,
     get baseRetryDelayMs() {
         return Math.max(0, Number(process.env.UPSTREAM_CAPACITY_RETRY_DELAY_MS || 1000));
     },

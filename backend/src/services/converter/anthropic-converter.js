@@ -1400,7 +1400,7 @@ export function preprocessAnthropicRequest(request) {
     // 预清洗：移除空 text 块（部分上游会把 text:"" 当作“未设置”，从而报 Field required）
     // 典型复现：OpenAI 端点 tool_calls 的 assistant.content 为 ""/[]，客户端换用 Anthropic 端点回放时会生成 {type:"text",text:""}。
     let didMutate = false;
-    const sanitizedMessages = request.messages.map((msg) => {
+    let sanitizedMessages = request.messages.map((msg) => {
         if (!msg || !Array.isArray(msg.content)) return msg;
 
         const filtered = [];
@@ -1427,6 +1427,148 @@ export function preprocessAnthropicRequest(request) {
 
         return { ...msg, content: filtered };
     });
+
+    // 工具链协议修复：某些客户端会把同一轮 assistant 的多个 tool_use 对应的 tool_result
+    // 拆成多条连续的 user 消息回传；但 Anthropic 要求 tool_result 必须紧跟包含对应 tool_use 的上一条 assistant 消息。
+    // 这里做一个保守的“合并/归一化”，优先尝试把连续的 user tool_result 消息合并到同一条 user 消息中，
+    // 并在必要时合并相邻的 assistant 消息（修复“额外的空 assistant 消息”插入导致的 tool_result 校验失败）。
+    const normalizeToolResultChain = (msgs) => {
+        if (!Array.isArray(msgs) || msgs.length < 2) return { messages: msgs, mutated: false };
+
+        const out = msgs.slice();
+        let mutated = false;
+
+        const isToolResultBlock = (b) =>
+            !!(b && typeof b === 'object' && b.type === 'tool_result' && b.tool_use_id);
+
+        const userHasToolResult = (m) =>
+            !!(m && m.role === 'user' && Array.isArray(m.content) && m.content.some(isToolResultBlock));
+
+        const assistantHasAnyToolUse = (m) => {
+            if (!m || m.role !== 'assistant' || !Array.isArray(m.content)) return false;
+            return m.content.some(b => b && typeof b === 'object' && b.type === 'tool_use' && b.id);
+        };
+
+        for (let i = 1; i < out.length; i++) {
+            let msg = out[i];
+            if (!userHasToolResult(msg)) continue;
+            if (!Array.isArray(msg.content)) continue;
+
+            // 1) 合并连续 user 消息：把当前 tool_result 消息并入前一条 user 消息
+            while (i > 0 && out[i - 1]?.role === 'user' && Array.isArray(out[i - 1].content)) {
+                const prev = out[i - 1];
+                out[i - 1] = { ...prev, content: [...prev.content, ...msg.content] };
+                out.splice(i, 1);
+                mutated = true;
+                i -= 1;
+                msg = out[i];
+                if (!msg) break;
+            }
+
+            // 2) 合并相邻 assistant 消息：如果 tool_result 前一条是 assistant 但没有 tool_use，
+            //    尝试向前合并，避免“空/占位 assistant 消息”破坏 tool_result 的相邻性约束。
+            while (
+                i > 1 &&
+                out[i - 1]?.role === 'assistant' &&
+                out[i - 2]?.role === 'assistant' &&
+                !assistantHasAnyToolUse(out[i - 1])
+            ) {
+                const prev = out[i - 1];
+                const prev2 = out[i - 2];
+                if (!Array.isArray(prev2.content) || !Array.isArray(prev.content)) break;
+                out[i - 2] = { ...prev2, content: [...prev2.content, ...prev.content] };
+                out.splice(i - 1, 1);
+                mutated = true;
+                i -= 1;
+            }
+        }
+
+        return { messages: out, mutated };
+    };
+
+    const toolChainNormalized = normalizeToolResultChain(sanitizedMessages);
+    if (toolChainNormalized.mutated) {
+        sanitizedMessages = toolChainNormalized.messages;
+        didMutate = true;
+    }
+
+    // 工具链协议修复（更保守）：如果 user 回传了“孤儿 tool_result”
+    // （即：上一条消息不是包含对应 tool_use(id=tool_use_id) 的 assistant），
+    // 上游会直接 invalid_request_error。此时我们无法可靠“补回” tool_use，只能降级为普通 text，
+    // 以保留工具输出内容并让请求继续进行。
+    const repairOrphanToolResults = (msgs) => {
+        if (!Array.isArray(msgs) || msgs.length < 1) return { messages: msgs, mutated: false };
+
+        const out = msgs.slice();
+        let mutated = false;
+
+        const stringifyToolResultContent = (content) => {
+            if (typeof content === 'string') return content;
+            try {
+                return JSON.stringify(content);
+            } catch {
+                return String(content ?? '');
+            }
+        };
+
+        const maxChars = Number(process.env.TOOL_RESULT_MAX_CHARS ?? 0);
+        const clamp = (s) => {
+            const str = typeof s === 'string' ? s : String(s ?? '');
+            if (!Number.isFinite(maxChars) || maxChars <= 0) return str;
+            if (str.length <= maxChars) return str;
+            return str.slice(0, maxChars) + '\n...[truncated]';
+        };
+
+        const getPrevToolUseIds = (prevMsg) => {
+            const ids = new Set();
+            if (!prevMsg || prevMsg.role !== 'assistant' || !Array.isArray(prevMsg.content)) return ids;
+            for (const b of prevMsg.content) {
+                if (b && typeof b === 'object' && b.type === 'tool_use' && b.id) ids.add(String(b.id));
+            }
+            return ids;
+        };
+
+        for (let i = 0; i < out.length; i++) {
+            const msg = out[i];
+            if (!msg || msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+
+            const prevToolUseIds = getPrevToolUseIds(out[i - 1]);
+            const nextContent = [];
+            let localMutate = false;
+
+            for (const block of msg.content) {
+                if (block && typeof block === 'object' && block.type === 'tool_result' && block.tool_use_id) {
+                    const id = String(block.tool_use_id);
+                    if (prevToolUseIds.has(id)) {
+                        nextContent.push(block);
+                        continue;
+                    }
+
+                    // Orphan: convert to text (preserve content, avoid upstream tool validation failure)
+                    const raw = stringifyToolResultContent(block.content);
+                    const text = clamp(raw);
+                    const prefix = `Orphan tool_result (missing previous tool_use for tool_use_id=${id}).\n`;
+                    nextContent.push({ type: 'text', text: (prefix + text).trim() || '\u200B' });
+                    localMutate = true;
+                    continue;
+                }
+                nextContent.push(block);
+            }
+
+            if (localMutate) {
+                out[i] = { ...msg, content: nextContent.length > 0 ? nextContent : [{ type: 'text', text: '\u200B' }] };
+                mutated = true;
+            }
+        }
+
+        return { messages: out, mutated };
+    };
+
+    const orphanRepaired = repairOrphanToolResults(sanitizedMessages);
+    if (orphanRepaired.mutated) {
+        sanitizedMessages = orphanRepaired.messages;
+        didMutate = true;
+    }
 
     // 检测 thinking 模式 - 显式启用或根据模型名自动启用
     const thinkingEnabled = request.thinking?.type === 'enabled' ||

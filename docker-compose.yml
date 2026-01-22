@@ -46,8 +46,6 @@ services:
       - MAX_CONCURRENT_PER_MODEL=${MAX_CONCURRENT_PER_MODEL:-5}
       # 每个账号的最大并发请求数（0=不限制）
       - MAX_CONCURRENT_PER_ACCOUNT=${MAX_CONCURRENT_PER_ACCOUNT:-1}
-      # 上游容量错误（429）切号重试次数
-      - UPSTREAM_CAPACITY_RETRIES=${UPSTREAM_CAPACITY_RETRIES:-2}
       # 上游容量错误重试延迟（毫秒）
       - UPSTREAM_CAPACITY_RETRY_DELAY_MS=${UPSTREAM_CAPACITY_RETRY_DELAY_MS:-1000}
       # 同号重试次数（非容量错误时，在换号前先重试几次）
@@ -116,6 +114,8 @@ services:
       - UPSTREAM_SSE_CAPTURE_PATH=${UPSTREAM_SSE_CAPTURE_PATH:-/app/data/upstream_sse.log}
       # 调试思考流程（1=开启，0=关闭）
       - DEBUG_THINKING_FLOW=${DEBUG_THINKING_FLOW:-0}
+      # 调试 Claude thinking signature 兜底逻辑
+      - DEBUG_CLAUDE_THINKING_SIGNATURE=${DEBUG_CLAUDE_THINKING_SIGNATURE:-0}
 
     ports:
       - "${PORT:-8088}:3000"

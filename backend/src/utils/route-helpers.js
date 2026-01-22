@@ -108,6 +108,17 @@ export function isNonRetryableError(err) {
     const msgLower = msg.toLowerCase();
     const status = err?.upstreamStatus;
 
+    // Google upstream bot-detection HTML ("Sorry..." / automated queries) should not be retried aggressively.
+    // Retrying across accounts usually worsens the block (IP-level), so fail fast.
+    if (
+        msgLower.includes('sending automated queries') ||
+        msgLower.includes('automated requests') ||
+        msgLower.includes('google \"sorry\"') ||
+        msgLower.includes('support.google.com/websearch/answer/86640')
+    ) {
+        return true;
+    }
+
     // 认证错误需要特殊处理（刷新 token 后重试），不算"不可重试"
     if (isAuthenticationError(err)) {
         return false;
@@ -179,4 +190,3 @@ export const SSE_HEADERS_ANTHROPIC = Object.freeze({
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'
 });
-
