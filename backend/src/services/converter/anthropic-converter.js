@@ -43,10 +43,13 @@ const DEBUG_IMAGE_MIME = (() => {
 
 // Whether to persist lastSig -> tool_use_id when we have to fall back (potentially polluting).
 // Default behavior:
-// - enabled, but DO NOT write back for userKey='api_key:static' unless explicitly allowed.
+// - DISABLED by default to prevent cache pollution from stale signatures.
+// - When a tool_use_id has no cached signature, lastSig is used for the current request only,
+//   but NOT written back to the main cache, avoiding permanent wrong bindings.
+// - Set CLAUDE_LAST_SIG_WRITEBACK=true to enable write-back (use with caution).
 const CLAUDE_LAST_SIG_WRITEBACK_ENABLED = (() => {
     const raw = process.env.CLAUDE_LAST_SIG_WRITEBACK;
-    if (raw === undefined || raw === null || raw === '') return true;
+    if (raw === undefined || raw === null || raw === '') return false;
     const v = String(raw).trim().toLowerCase();
     return ['1', 'true', 'yes', 'y', 'on'].includes(v);
 })();
