@@ -1,5 +1,5 @@
 import { OAUTH_CONFIG } from '../config.js';
-import { createAccount, getAccountByEmail, getAccountById } from '../db/index.js';
+import { createAccount, getAccountByEmail, getAccountById, updateAccountToken, deleteAccount } from '../db/index.js';
 import { initializeAccount } from '../services/tokenManager.js';
 import { verifyAdmin } from '../middleware/auth.js';
 
@@ -78,12 +78,26 @@ export default async function oauthRoutes(fastify) {
 
             // 创建新账号
             const accountId = createAccount(email || `oauth_${Date.now()}`, refresh_token);
-            account = { id: accountId, email, refresh_token, access_token };
+
+            // 立即保存 token 到数据库，避免 initializeAccount 触发不必要的刷新
+            const expiresInSec = Number(expires_in);
+            if (Number.isFinite(expiresInSec) && expiresInSec > 0) {
+                updateAccountToken(accountId, access_token, expiresInSec);
+            }
+
+            // 从数据库重新读取账号（包含完整信息）
+            account = getAccountById(accountId);
+            if (!account) {
+                // 清理可能存在的幽灵账号
+                try { deleteAccount(accountId); } catch { /* ignore */ }
+                return reply.code(400).send({
+                    success: false,
+                    message: '账号创建后丢失'
+                });
+            }
 
             // 初始化账号
             try {
-                account.access_token = access_token;
-                account.refresh_token = refresh_token;
                 await initializeAccount(account);
             } catch (initError) {
                 // 检查账号是否被删除（重复账号情况）
@@ -94,6 +108,12 @@ export default async function oauthRoutes(fastify) {
                         message: initError.message
                     });
                 }
+                // 与 /admin/accounts 行为保持一致：初始化失败删除账号并返回错误
+                deleteAccount(account.id);
+                return reply.code(400).send({
+                    success: false,
+                    message: initError.message || '账号初始化失败'
+                });
             }
 
             // Read back the latest account data (project_id might have been updated during initialization).

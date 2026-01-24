@@ -18,6 +18,10 @@ function toQuotaFraction(value, fallback = 0) {
     return Math.max(0, Math.min(1, num));
 }
 
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * 刷新账号的 access_token
  */
@@ -111,58 +115,84 @@ export async function ensureValidToken(account) {
 /**
  * 通过 onboardUser 端点注册用户并获取 projectId（适用于从未登录过 Antigravity 的用户）
  * 会先尝试 standard-tier，失败后尝试 free-tier
+ * onboardUser 是异步操作，需要轮询等待 done: true
  */
 async function onboardUser(account) {
     const tiers = ['standard-tier', 'free-tier'];
+    const maxAttempts = 8; // 增加到 8 次，总等待时间约 16 秒
+    const pollDelayMs = 2000;
     let lastError = null;
 
     for (const tierId of tiers) {
-        try {
-            const response = await fetch('https://cloudcode-pa.googleapis.com/v1internal:onboardUser', {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${account.access_token}`,
-                    'Content-Type': 'application/json',
-                    'User-Agent': ANTIGRAVITY_CONFIG.user_agent
-                },
-                body: JSON.stringify({
-                    tierId: tierId,
-                    metadata: {
-                        ideType: 'ANTIGRAVITY',
-                        platform: 'PLATFORM_UNSPECIFIED',
-                        pluginType: 'GEMINI'
+        let noProjectIdRetries = 0; // done=true 但无 projectId 的重试计数
+
+        // 对每个 tier 进行轮询重试
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const response = await fetch('https://cloudcode-pa.googleapis.com/v1internal:onboardUser', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${account.access_token}`,
+                        'Content-Type': 'application/json',
+                        'User-Agent': ANTIGRAVITY_CONFIG.user_agent
+                    },
+                    body: JSON.stringify({
+                        tierId: tierId,
+                        metadata: {
+                            ideType: 'ANTIGRAVITY',
+                            platform: 'PLATFORM_UNSPECIFIED',
+                            pluginType: 'GEMINI'
+                        }
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({}));
+                    lastError = new Error(errorData.error?.message || `Failed to onboard user: ${response.status}`);
+                    // 429、408、409、5xx 错误：等待后重试当前 tier
+                    if (response.status === 429 || response.status === 408 || response.status === 409 || response.status >= 500) {
+                        await sleep(pollDelayMs);
+                        continue;
                     }
-                })
-            });
+                    // 其他错误：尝试下一个 tier
+                    break;
+                }
 
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                lastError = new Error(errorData.error?.message || `Failed to onboard user: ${response.status}`);
-                continue; // 尝试下一个 tier
-            }
+                const data = await response.json();
 
-            const data = await response.json();
+                // onboardUser 是异步操作，done: false 表示操作进行中，需要等待后重试
+                if (!data.done) {
+                    lastError = new Error('Onboard operation not completed');
+                    await sleep(pollDelayMs);
+                    continue;
+                }
 
-            if (!data.done) {
-                lastError = new Error('Onboard operation not completed');
+                // 提取 projectId（兼容字符串或对象格式）
+                const projectInfo = data.response?.cloudaicompanionProject;
+                const projectId = typeof projectInfo === 'string' ? projectInfo : projectInfo?.id;
+                if (!projectId) {
+                    // done=true 但无 projectId，可能是上游短暂一致性问题，重试 2 次
+                    noProjectIdRetries++;
+                    if (noProjectIdRetries <= 2) {
+                        lastError = new Error('No project ID in onboard response (retrying)');
+                        await sleep(pollDelayMs);
+                        continue;
+                    }
+                    lastError = new Error('No project ID in onboard response');
+                    break; // 重试次数用完，尝试下一个 tier
+                }
+
+                return {
+                    projectId,
+                    projectName: typeof projectInfo === 'object' ? projectInfo.name : null,
+                    projectNumber: typeof projectInfo === 'object' ? projectInfo.projectNumber : null,
+                    tierId: tierId
+                };
+            } catch (error) {
+                lastError = error;
+                await sleep(pollDelayMs);
                 continue;
             }
-
-            const projectInfo = data.response?.cloudaicompanionProject;
-            if (!projectInfo?.id) {
-                lastError = new Error('No project ID in onboard response');
-                continue;
-            }
-
-            return {
-                projectId: projectInfo.id,
-                projectName: projectInfo.name,
-                projectNumber: projectInfo.projectNumber,
-                tierId: tierId
-            };
-        } catch (error) {
-            lastError = error;
-            continue;
         }
     }
 
