@@ -101,7 +101,7 @@ services:
       - ANTHROPIC_SSE_DEFER_NON_THINKING_MS=300
       - ANTHROPIC_SSE_DEFER_NON_THINKING_CHUNKS=2
       # 空思考块处理模式：emit（发送）| redacted（标记已编辑）| suppress（抑制）
-      - ANTHROPIC_SSE_EMPTY_THINKING_MODE=emit
+      - ANTHROPIC_SSE_EMPTY_THINKING_MODE=suppress
 
       # ============ 其他配置 ============
       # 仪表盘「今日」统计时区偏移（分钟），中国时间为 480
