@@ -47,6 +47,96 @@ const thinkingState = new Map();
 const claudeToolThinkingBuffer = new Map(); // requestId -> { signature, thoughtText, pendingToolCallIds }
 
 /**
+ * 拆分 OpenAI tool message 的多模态内容
+ *
+ * tool message 的 content 可能是多模态数组（包含 text + image_url 块）。
+ * 如果直接 JSON.stringify()，图片会变成巨大的 base64 字符串，导致：
+ * 1. 上游模型无法识别图片
+ * 2. Token 消耗暴涨（约 100 倍差距）
+ *
+ * 本函数将内容拆分为：
+ * - textParts: 纯文本内容（用换行符连接）
+ * - inlineDataParts: 从 image_url 块提取的 inlineData parts
+ *
+ * @param {string|Array|*} content - tool message 的 content 字段
+ * @returns {{ textParts: string|*, inlineDataParts: Array }}
+ */
+function splitOpenAIToolResultContent(content) {
+    // 非数组内容保持原样处理
+    if (!Array.isArray(content)) {
+        return { textParts: content, inlineDataParts: [] };
+    }
+
+    const texts = [];
+    const inlineDataParts = [];
+
+    for (const item of content) {
+        if (!item) continue;
+
+        // 处理纯字符串元素
+        if (typeof item === 'string') {
+            if (item) texts.push(item);
+            continue;
+        }
+
+        // 非对象类型 - 转为字符串保留
+        if (typeof item !== 'object') {
+            texts.push(String(item));
+            continue;
+        }
+
+        // 处理标准 text 块
+        if (item.type === 'text' && typeof item.text === 'string') {
+            if (item.text) texts.push(item.text);
+            continue;
+        }
+
+        // 处理 image_url 块 - 转换为 inlineData
+        if (item.type === 'image_url' && typeof item.image_url?.url === 'string' && item.image_url.url) {
+            const parsed = parseDataUrl(item.image_url.url);
+            if (parsed?.data) {
+                inlineDataParts.push({
+                    inlineData: {
+                        mimeType: parsed.mimeType,
+                        data: parsed.data
+                    }
+                });
+            }
+            continue;
+        }
+
+        // 兜底：尝试提取非标准块中的文本
+        if (typeof item.text === 'string' && item.text) {
+            texts.push(item.text);
+            continue;
+        }
+        if (typeof item.content === 'string' && item.content) {
+            texts.push(item.content);
+            continue;
+        }
+
+        // 最终兜底：未知块类型，序列化为 JSON 保留信息（但排除可能的大型二进制数据）
+        // 避免静默丢失数据
+        try {
+            const itemType = item.type || 'unknown';
+            // 如果块包含可能的二进制数据字段，只保留类型信息
+            if (item.image_url?.url || item.data) {
+                texts.push(`[${itemType}_block]`);
+            } else {
+                texts.push(JSON.stringify(item));
+            }
+        } catch {
+            texts.push(`[unserializable_block]`);
+        }
+    }
+
+    return {
+        textParts: texts.join('\n'),
+        inlineDataParts
+    };
+}
+
+/**
  * OpenAI request -> Antigravity request
  */
 export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessionId = null) {
@@ -182,14 +272,19 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         const msg = nonSystemMessages[i];
 
         // Merge consecutive tool results into one user message
+        // 支持多模态内容：将 base64 图片提取为 inlineData，避免 JSON.stringify 导致的 token 暴涨
         if (msg.role === 'tool') {
             const toolParts = [];
             while (i < nonSystemMessages.length && nonSystemMessages[i].role === 'tool') {
                 const toolMsg = nonSystemMessages[i];
+
+                // 拆分多模态内容：文本 vs 图片
+                const { textParts, inlineDataParts } = splitOpenAIToolResultContent(toolMsg.content);
+
                 // Cross-model history: if current is Claude but tool_call_id isn't Claude-style (toolu_), degrade to text context
                 if (isClaudeModel && toolMsg.tool_call_id && !looksLikeClaudeToolId(toolMsg.tool_call_id)) {
                     const name = toolMsg.name || 'unknown';
-                    const output = limitToolOutput(toolMsg.content, toolOutputLimiter, {
+                    const output = limitToolOutput(textParts, toolOutputLimiter, {
                         provider: 'openai',
                         route: '/v1/chat/completions',
                         model: model || null,
@@ -197,8 +292,13 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                         tool_call_id: toolMsg.tool_call_id
                     });
                     toolParts.push({ text: `[tool:${name}] ${output}` });
+
+                    // 添加提取的 inlineData parts（图片）
+                    if (inlineDataParts.length > 0) {
+                        toolParts.push(...inlineDataParts);
+                    }
                 } else {
-                    const output = limitToolOutput(toolMsg.content, toolOutputLimiter, {
+                    const output = limitToolOutput(textParts, toolOutputLimiter, {
                         provider: 'openai',
                         route: '/v1/chat/completions',
                         model: model || null,
@@ -212,6 +312,11 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
                             response: { output }
                         }
                     });
+
+                    // 添加提取的 inlineData parts（图片）
+                    if (inlineDataParts.length > 0) {
+                        toolParts.push(...inlineDataParts);
+                    }
                 }
                 i++;
             }
@@ -370,20 +475,25 @@ function convertMessage(msg, ctx = {}) {
     } = ctx;
     const role = msg.role === 'assistant' ? 'model' : 'user';
 
-    // tool result
+    // tool result - 支持多模态内容
     if (msg.role === 'tool') {
-        return {
-            role: 'user',
-            parts: [{
-                functionResponse: {
-                    id: msg.tool_call_id,
-                    name: msg.name || 'unknown',
-                    response: {
-                        output: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-                    }
-                }
-            }]
-        };
+        const { textParts, inlineDataParts } = splitOpenAIToolResultContent(msg.content);
+        const output = typeof textParts === 'string' ? textParts : JSON.stringify(textParts);
+
+        const parts = [{
+            functionResponse: {
+                id: msg.tool_call_id,
+                name: msg.name || 'unknown',
+                response: { output }
+            }
+        }];
+
+        // 添加提取的 inlineData parts（图片）
+        if (inlineDataParts.length > 0) {
+            parts.push(...inlineDataParts);
+        }
+
+        return { role: 'user', parts };
     }
 
     // assistant tool_calls

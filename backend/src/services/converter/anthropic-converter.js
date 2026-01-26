@@ -187,6 +187,97 @@ function normalizeIncomingAnthropicImageBase64({ media_type, data }, ctx = {}) {
     return { mimeType, data: normalizedData };
 }
 
+/**
+ * 拆分 Anthropic tool_result 的多模态内容
+ *
+ * tool_result.content 可能是多模态数组（包含 text + base64 image 块）。
+ * 如果直接 JSON.stringify()，图片会变成巨大的 base64 字符串，导致：
+ * 1. 上游模型无法识别图片
+ * 2. Token 消耗暴涨（约 100 倍差距）
+ *
+ * 本函数将内容拆分为：
+ * - textParts: 纯文本内容（用换行符连接）
+ * - inlineDataParts: 从 image 块提取的 inlineData parts
+ *
+ * @param {string|Array|*} content - tool_result 的 content 字段
+ * @param {Object} ctx - 上下文参数，包含 userKey 等
+ * @returns {{ textParts: string, inlineDataParts: Array }}
+ */
+function splitAnthropicToolResultContent(content, ctx = {}) {
+    // 非数组内容保持原样处理
+    if (!Array.isArray(content)) {
+        return { textParts: content, inlineDataParts: [] };
+    }
+
+    const texts = [];
+    const inlineDataParts = [];
+
+    for (const block of content) {
+        if (!block) continue;
+
+        // 处理纯字符串元素
+        if (typeof block === 'string') {
+            if (block) texts.push(block);
+            continue;
+        }
+
+        // 非对象类型 - 转为字符串保留
+        if (typeof block !== 'object') {
+            texts.push(String(block));
+            continue;
+        }
+
+        // 处理标准 text 块
+        if (block.type === 'text' && typeof block.text === 'string') {
+            if (block.text) texts.push(block.text);
+            continue;
+        }
+
+        // 处理 base64 图片块 - 转换为 inlineData
+        if (block.type === 'image' && block.source?.type === 'base64') {
+            const fixed = normalizeIncomingAnthropicImageBase64(block.source, {
+                userKey: ctx?.userKey ?? null
+            });
+            inlineDataParts.push({
+                inlineData: {
+                    mimeType: fixed.mimeType ?? block.source.media_type,
+                    data: fixed.data ?? block.source.data
+                }
+            });
+            continue;
+        }
+
+        // 兜底：尝试提取非标准块中的文本
+        if (typeof block.text === 'string' && block.text) {
+            texts.push(block.text);
+            continue;
+        }
+        if (typeof block.content === 'string' && block.content) {
+            texts.push(block.content);
+            continue;
+        }
+
+        // 最终兜底：未知块类型，序列化为 JSON 保留信息（但排除可能的大型二进制数据）
+        // 避免静默丢失数据
+        try {
+            const blockType = block.type || 'unknown';
+            // 如果块包含可能的二进制数据字段，只保留类型信息
+            if (block.source?.data || block.data) {
+                texts.push(`[${blockType}_block]`);
+            } else {
+                texts.push(JSON.stringify(block));
+            }
+        } catch {
+            texts.push(`[unserializable_block]`);
+        }
+    }
+
+    return {
+        textParts: texts.join('\n'),
+        inlineDataParts
+    };
+}
+
 // ==================== Anthropic 格式转换 ====================
 
 /**
@@ -276,26 +367,40 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         const msg = messages[i];
 
         // 处理 tool_result 消息（Anthropic 的工具返回格式）
+        // 支持多模态内容：将 base64 图片提取为 inlineData，避免 JSON.stringify 导致的 token 暴涨
         if (msg.role === 'user' && Array.isArray(msg.content)) {
             const toolResults = msg.content.filter(c => c.type === 'tool_result');
             if (toolResults.length > 0) {
-                const parts = toolResults.map(tr => {
+                const parts = [];
+                for (const tr of toolResults) {
                     const toolName = tr.name || toolUseNameById.get(tr.tool_use_id) || 'unknown';
-                    const output = limitToolOutput(tr.content, toolOutputLimiter, {
+
+                    // 拆分多模态内容：文本 vs 图片
+                    const { textParts, inlineDataParts } = splitAnthropicToolResultContent(tr.content, { userKey });
+
+                    // 对文本部分应用 limitToolOutput
+                    const output = limitToolOutput(textParts, toolOutputLimiter, {
                         provider: 'anthropic',
                         route: '/v1/messages',
                         model: model || null,
                         tool_name: toolName,
                         tool_use_id: tr.tool_use_id
                     });
-                    return {
+
+                    // 添加 functionResponse part
+                    parts.push({
                         functionResponse: {
                             id: tr.tool_use_id,
                             name: toolName,
                             response: { output }
                         }
-                    };
-                });
+                    });
+
+                    // 添加提取的 inlineData parts（图片）
+                    if (inlineDataParts.length > 0) {
+                        parts.push(...inlineDataParts);
+                    }
+                }
                 contents.push({ role: 'user', parts });
                 continue;
             }
@@ -713,17 +818,23 @@ function convertAnthropicMessage(msg, thinkingEnabled = false, ctx = {}) {
                 continue;
             }
 
-            // 处理工具结果
+            // 处理工具结果 - 支持多模态内容
             if (item.type === 'tool_result') {
+                const { textParts, inlineDataParts } = splitAnthropicToolResultContent(item.content, { userKey });
+                const output = typeof textParts === 'string' ? textParts : JSON.stringify(textParts);
+
                 regularParts.push({
                     functionResponse: {
                         id: item.tool_use_id,
                         name: item.name || 'unknown',
-                        response: {
-                            output: typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
-                        }
+                        response: { output }
                     }
                 });
+
+                // 添加提取的 inlineData parts（图片）
+                if (inlineDataParts.length > 0) {
+                    regularParts.push(...inlineDataParts);
+                }
                 continue;
             }
 
