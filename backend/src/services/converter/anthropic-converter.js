@@ -1846,6 +1846,17 @@ export function preprocessAnthropicRequest(request) {
         return didMutate ? { ...request, messages: sanitizedMessages } : request;
     }
 
+    // Gemini 模型跳过 Claude 专用的 thinking 签名修复逻辑
+    // Gemini 的 thoughtSignature 在 convertAnthropicMessage 中通过 toolThoughtSignatureCache 独立处理
+    // 如果对 Gemini 执行 Claude 的签名修复，会导致：
+    // 1. 从 Claude 缓存恢复到错误的签名并注入 redacted_thinking 块
+    // 2. 或者因为找不到签名而降级禁用 thinking
+    // 两种情况都会导致上游报错 "Corrupted thought signature"
+    const preprocessModelInfo = detectModelFamily(request.model);
+    if (!preprocessModelInfo.isClaudeModel) {
+        return didMutate ? { ...request, messages: sanitizedMessages } : request;
+    }
+
     const extractSystemText = (sys) => {
         const texts = [];
         if (typeof sys === 'string') {
