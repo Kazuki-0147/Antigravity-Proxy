@@ -127,12 +127,21 @@ function runPkg(buildDir, pkgTarget, outputPath) {
     };
 
     console.log(`[pkg] Building ${pkgTarget} -> ${outputPath}`);
-    const res = spawnSync(pkgBin, ['package.json', '--targets', pkgTarget, '--output', outputPath], {
+    const res = spawnSync(pkgBin, ['package.json', '--targets', pkgTarget, '--output', outputPath, '--debug'], {
         cwd: buildDir,
         stdio: 'inherit',
-        env
+        env,
+        // Windows 需要 shell 模式运行 .cmd
+        shell: process.platform === 'win32'
     });
-    if (res.status !== 0) process.exit(res.status ?? 1);
+    if (res.error) {
+        console.error('[pkg] Spawn error:', res.error);
+        process.exit(1);
+    }
+    if (res.status !== 0) {
+        console.error(`[pkg] Failed with exit code ${res.status}`);
+        process.exit(res.status ?? 1);
+    }
 }
 
 async function main() {
