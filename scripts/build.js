@@ -268,27 +268,23 @@ async function main() {
 
     // 创建压缩包
     const isWindows = target.includes('win');
-    const archiveName = isWindows
+    let archiveName = isWindows
         ? `antigravity-proxy-${target}.zip`
         : `antigravity-proxy-${target}.tar.gz`;
-    const archivePath = path.join(releaseDir, archiveName);
+    let archivePath = path.join(releaseDir, archiveName);
 
     if (isWindows) {
-        // Windows: 使用 zip
-        // 检查是否有 zip 命令，否则使用 PowerShell
-        const zipResult = spawnSync('zip', ['-r', archivePath, '.'], {
-            cwd: archiveDir,
-            stdio: 'pipe'
+        // Windows: 使用 PowerShell Compress-Archive
+        const psResult = spawnSync('powershell', [
+            '-NoProfile', '-Command',
+            `Compress-Archive -Path '${archiveDir}\\*' -DestinationPath '${archivePath}' -Force`
+        ], {
+            stdio: 'inherit'
         });
-        if (zipResult.status !== 0) {
-            // 回退到 tar（如果在 Linux/macOS 上交叉编译 Windows 版本）
-            spawnSync('tar', ['-czvf', archivePath.replace('.zip', '.tar.gz'), '-C', archiveDir, '.'], {
-                stdio: 'inherit'
-            });
-            console.log(`  ✓ Created ${archiveName.replace('.zip', '.tar.gz')} (fallback)`);
-        } else {
-            console.log(`  ✓ Created ${archiveName}`);
+        if (psResult.status !== 0) {
+            throw new Error(`Failed to create zip archive: exit code ${psResult.status}`);
         }
+        console.log(`  ✓ Created ${archiveName}`);
     } else {
         // Linux/macOS: 使用 tar.gz
         spawnSync('tar', ['-czvf', archivePath, '-C', archiveDir, '.'], {
