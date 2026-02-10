@@ -100,8 +100,8 @@ export const MODEL_MAPPING = {
     'claude-4-5': 'claude-opus-4-5-thinking',
     // thinking 版本在上游是独立模型：不要降级到非 thinking，否则会导致工具调用场景无思维链输出
     'claude-sonnet-4-5-thinking': 'claude-sonnet-4-5-thinking',
-    // Claude Haiku 不存在，映射到 Opus
-    'claude-haiku-4-5-20251001': 'claude-opus-4-5-thinking',
+    // Claude Haiku 不存在，映射到 Opus 4.6
+    'claude-haiku-4-5-20251001': 'claude-opus-4-6',
     'gemini-2.5-flash-thinking': 'gemini-2.5-flash',
     'gemini-3-flash-thinking': 'gemini-3-flash',
     // 兼容旧版模型名称
@@ -125,7 +125,6 @@ export const THINKING_MODELS = [
     'claude-opus-4-6-thinking',
     'claude-opus-4-5-thinking',
     'claude-sonnet-4-5-thinking',
-    'claude-haiku-4-5-20251001',
     'gpt-oss-120b-medium'
 ];
 
