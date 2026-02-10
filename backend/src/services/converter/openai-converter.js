@@ -39,12 +39,186 @@ const OPENAI_THINKING_INCLUDE_TAGS =
     OPENAI_THINKING_OUTPUT === 'tag' ||
     OPENAI_THINKING_OUTPUT === 'both';
 
+const THINKING_EFFORT_BUDGET_MAP = Object.freeze({
+    minimal: 1024,
+    low: 2048,
+    medium: DEFAULT_THINKING_BUDGET,
+    high: 8192,
+    max: 16384
+});
+
 // Track whether a stream is currently inside <think>...</think>
 const thinkingState = new Map();
+const openAIStreamToolCallSeen = new Map();
 
 // Stream buffer: some upstreams send tool_calls first, then thought/signature later.
 // Keep pending tool_call_ids until signature arrives.
 const claudeToolThinkingBuffer = new Map(); // requestId -> { signature, thoughtText, pendingToolCallIds }
+
+function normalizeModelName(model) {
+    return String(model || '').trim().toLowerCase();
+}
+
+function isClaude46Model(model) {
+    const name = normalizeModelName(model);
+    return name.includes('claude-opus-4-6') || name.includes('claude-4-6');
+}
+
+function normalizeThinkingType(rawType) {
+    if (rawType === undefined || rawType === null) return null;
+    const value = String(rawType).trim().toLowerCase();
+    if (!value) return null;
+    if (value === 'enabled' || value === 'disabled' || value === 'adaptive') return value;
+    return null;
+}
+
+function normalizeThinkingEffort(rawEffort) {
+    if (rawEffort === undefined || rawEffort === null) return null;
+    const value = String(rawEffort).trim().toLowerCase();
+    if (!value) return null;
+    return THINKING_EFFORT_BUDGET_MAP[value] ? value : null;
+}
+
+function resolveOpenAIThinkingSettings(openaiRequest, model) {
+    const thinking = openaiRequest?.thinking && typeof openaiRequest.thinking === 'object'
+        ? openaiRequest.thinking
+        : null;
+    const normalizedType = normalizeThinkingType(thinking?.type);
+    const normalizedEffort = normalizeThinkingEffort(thinking?.effort ?? openaiRequest?.thinking_effort);
+
+    const parsedBudget = Number(
+        openaiRequest?.thinking_budget ??
+        openaiRequest?.budget_tokens ??
+        thinking?.budget_tokens ??
+        thinking?.budgetTokens
+    );
+    const hasExplicitBudget = Number.isFinite(parsedBudget) && parsedBudget > 0;
+    const effortBudget = normalizedEffort ? THINKING_EFFORT_BUDGET_MAP[normalizedEffort] : null;
+
+    const enableThinking = normalizedType === 'enabled' ||
+        normalizedType === 'adaptive' ||
+        (normalizedType !== 'disabled' && (
+            isThinkingModel(model) ||
+            hasExplicitBudget ||
+            normalizedEffort !== null
+        ));
+
+    const rawBudget = hasExplicitBudget ? Math.floor(parsedBudget) : (effortBudget || DEFAULT_THINKING_BUDGET);
+
+    return {
+        enableThinking,
+        rawBudget
+    };
+}
+
+function resolveOutputFormat(openaiRequest) {
+    const outputConfigFormat = openaiRequest?.output_config && typeof openaiRequest.output_config === 'object'
+        ? openaiRequest.output_config.format
+        : undefined;
+    if (typeof outputConfigFormat === 'string' && outputConfigFormat.trim()) {
+        return outputConfigFormat.trim();
+    }
+
+    if (typeof openaiRequest?.output_format === 'string' && openaiRequest.output_format.trim()) {
+        return openaiRequest.output_format.trim();
+    }
+
+    const responseFormat = openaiRequest?.response_format;
+    if (responseFormat && typeof responseFormat === 'object' && typeof responseFormat.type === 'string' && responseFormat.type.trim()) {
+        return responseFormat.type.trim();
+    }
+
+    return null;
+}
+
+function mapOutputFormatToResponseMimeType(outputFormat) {
+    const normalized = String(outputFormat || '').trim().toLowerCase();
+    if (!normalized) return null;
+    if (normalized === 'json' || normalized === 'json_object' || normalized === 'json_schema') return 'application/json';
+    if (normalized === 'text') return 'text/plain';
+    if (normalized === 'markdown') return 'text/markdown';
+    return null;
+}
+
+function mapFinishReasonToOpenAIFinishReason(finishReason, hasToolCalls = false) {
+    if (hasToolCalls) return 'tool_calls';
+
+    const normalized = String(finishReason || '').trim().toUpperCase();
+    if (!normalized || normalized === 'STOP' || normalized === 'OTHER' || normalized === 'STOP_SEQUENCE') return 'stop';
+
+    if (normalized === 'MAX_TOKENS' || normalized === 'MAX_OUTPUT_TOKENS' || normalized === 'MODEL_CONTEXT_WINDOW_EXCEEDED') {
+        return 'length';
+    }
+
+    if (normalized === 'PAUSE' || normalized === 'PAUSE_TURN') return 'pause_turn';
+
+    if (
+        normalized === 'SAFETY' ||
+        normalized === 'BLOCKLIST' ||
+        normalized === 'PROHIBITED_CONTENT' ||
+        normalized === 'SPII' ||
+        normalized === 'IMAGE_SAFETY' ||
+        normalized === 'RECITATION' ||
+        normalized === 'LANGUAGE' ||
+        normalized === 'MALFORMED_FUNCTION_CALL' ||
+        normalized === 'UNEXPECTED_TOOL_CALL' ||
+        normalized === 'NO_IMAGE'
+    ) {
+        return 'content_filter';
+    }
+
+    return 'stop';
+}
+
+function resolveOpenAIToolChoiceConfig(toolChoice) {
+    let mode = 'VALIDATED';
+    let allowedFunctionNames = null;
+
+    if (toolChoice !== undefined && toolChoice !== null) {
+        if (typeof toolChoice === 'string') {
+            const type = toolChoice.trim().toLowerCase();
+            if (type === 'none') mode = 'NONE';
+            else if (type === 'auto') mode = 'AUTO';
+            else if (type === 'any' || type === 'required') mode = 'ANY';
+        } else if (typeof toolChoice === 'object') {
+            const type = String(toolChoice.type || '').trim().toLowerCase();
+            if (type === 'none') mode = 'NONE';
+            else if (type === 'auto') mode = 'AUTO';
+            else if (type === 'any' || type === 'required') mode = 'ANY';
+            else if (type === 'function' || type === 'tool') {
+                const name = typeof toolChoice?.name === 'string'
+                    ? toolChoice.name.trim()
+                    : (typeof toolChoice?.function?.name === 'string' ? toolChoice.function.name.trim() : '');
+                mode = 'ANY';
+                if (name) {
+                    allowedFunctionNames = [name];
+                }
+            }
+        }
+    }
+
+    const functionCallingConfig = { mode };
+    if (Array.isArray(allowedFunctionNames) && allowedFunctionNames.length > 0) {
+        functionCallingConfig.allowedFunctionNames = allowedFunctionNames;
+    }
+    return functionCallingConfig;
+}
+
+function extractOpenAIAssistantPrefillText(message) {
+    if (!message || message.role !== 'assistant') return null;
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) return null;
+
+    if (typeof message.content === 'string') return message.content;
+    if (!Array.isArray(message.content)) return null;
+
+    let out = '';
+    for (const item of message.content) {
+        if (!item || typeof item !== 'object') return null;
+        if (item.type !== 'text' || typeof item.text !== 'string') return null;
+        out += item.text;
+    }
+    return out;
+}
 
 /**
  * 拆分 OpenAI tool message 的多模态内容
@@ -149,10 +323,7 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         stream,
         tools,
         tool_choice,
-        stop,
-        // extended params: thinking budget
-        thinking_budget,
-        budget_tokens // alias
+        stop
     } = openaiRequest;
 
     const requestId = `agent-${uuidv4()}`;
@@ -163,23 +334,17 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         request_id: requestId
     });
 
-    // Extract system messages
-    const systemMessages = messages.filter((m) => m.role === 'system');
-    let systemContent = systemMessages
-        .map((m) => (typeof m.content === 'string' ? m.content : m.content.map((c) => c.text || '').join('\n')))
-        .join('\n');
-
-    // Convert chat messages (exclude system); merge consecutive tool results
+    const normalizedMessages = Array.isArray(messages) ? messages : [];
+    let workingMessages = normalizedMessages.slice();
     const contents = [];
-    const nonSystemMessages = messages.filter((m) => m.role !== 'system');
 
     // Actual model name
     const actualModel = getMappedModel(model);
 
-    // Tools or tool history?
-    const hasTools = tools && tools.length > 0;
-    const hasToolCallsInHistory = nonSystemMessages.some((msg) => msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0);
-    const hasToolResultsInHistory = nonSystemMessages.some((msg) => msg.role === 'tool');
+    const thinkingSettings = resolveOpenAIThinkingSettings(openaiRequest, model);
+    let { enableThinking, rawBudget: thinkingBudget } = thinkingSettings;
+    const normalizedOutputFormat = resolveOutputFormat(openaiRequest);
+    const outputMimeType = mapOutputFormatToResponseMimeType(normalizedOutputFormat);
 
     // Claude: no topP, and extended thinking requires signature replay on tool chain
     const isClaudeModel = String(model || '').includes('claude');
@@ -192,13 +357,72 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
 
     // Check if this is an image generation model (no system prompt, no thinking)
     const isImageModel = isImageGenerationModel(model);
+    const isClaude46Request = isClaude46Model(model) || isClaude46Model(actualModel);
 
     const looksLikeClaudeToolId = (id) => typeof id === 'string' && id.startsWith('toolu_');
 
+    // Claude API requires thinking budget >= 1024
+    const MIN_THINKING_BUDGET = 1024;
+    if (isClaudeModel) {
+        thinkingBudget = Math.max(MIN_THINKING_BUDGET, thinkingBudget);
+    }
+
+    // Extract system messages
+    let systemContent = workingMessages
+        .filter((m) => m?.role === 'system')
+        .map((m) => (typeof m.content === 'string' ? m.content : (Array.isArray(m.content) ? m.content.map((c) => c?.text || '').join('\n') : '')))
+        .join('\n');
+
+    // Claude 4.6: assistant prefill (especially JSON prefix "{") may violate upstream thinking validation.
+    // Remove trailing assistant prefill and move constraint into systemInstruction.
+    if (isClaudeModel && isClaude46Request && enableThinking) {
+        const looksLikeJsonOnlyInstruction =
+            systemContent.includes('ONLY generate the JSON object') ||
+            systemContent.includes('Only include these fields') ||
+            systemContent.includes('Format your response as a JSON object') ||
+            systemContent.includes('ONLY generate the JSON object, no other text');
+
+        let lastNonSystemIndex = -1;
+        for (let idx = workingMessages.length - 1; idx >= 0; idx--) {
+            if (workingMessages[idx]?.role !== 'system') {
+                lastNonSystemIndex = idx;
+                break;
+            }
+        }
+
+        if (lastNonSystemIndex >= 0) {
+            const lastMessage = workingMessages[lastNonSystemIndex];
+            const prefillText = extractOpenAIAssistantPrefillText(lastMessage);
+            if (prefillText !== null) {
+                workingMessages = [
+                    ...workingMessages.slice(0, lastNonSystemIndex),
+                    ...workingMessages.slice(lastNonSystemIndex + 1)
+                ];
+
+                const trimmed = prefillText.trim();
+                if (trimmed) {
+                    const hint =
+                        (trimmed === '{' || looksLikeJsonOnlyInstruction)
+                            ? "Return only a single JSON object and start your response with '{'."
+                            : `Start your response with the following prefix exactly (no extra characters before it): ${prefillText}`;
+                    if (!systemContent.includes(hint)) {
+                        systemContent = systemContent ? `${systemContent}\n\n${hint}` : hint;
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert chat messages (exclude system); merge consecutive tool results
+    const nonSystemMessages = workingMessages.filter((m) => m?.role !== 'system');
+
+    // Tools or tool history?
+    const hasTools = tools && tools.length > 0;
+    const hasToolCallsInHistory = nonSystemMessages.some((msg) => msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0);
+    const hasToolResultsInHistory = nonSystemMessages.some((msg) => msg.role === 'tool');
+
     // OpenAI side: Claude tool chain needs signature replay (only for Claude-generated tool_call_id)
     // If history contains Claude tool_calls/tool results but cache missing -> downgrade thinking to avoid upstream error
-    // Enable thinking: by model default OR by explicit thinking_budget/budget_tokens parameter
-    let enableThinking = isThinkingModel(model) || thinking_budget !== undefined || budget_tokens !== undefined;
     if (enableThinking && isClaudeModel && (hasToolCallsInHistory || hasToolResultsInHistory)) {
         const ids = new Set();
         for (const msg of nonSystemMessages) {
@@ -352,9 +576,6 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
         }
     }
 
-    // Thinking budget: thinking_budget -> budget_tokens -> default
-    const thinkingBudget = thinking_budget ?? budget_tokens ?? DEFAULT_THINKING_BUDGET;
-
     // generationConfig
     const generationConfig = {
         temperature: temperature ?? DEFAULT_TEMPERATURE,
@@ -381,6 +602,10 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
     // stop sequences
     if (stop) {
         generationConfig.stopSequences = Array.isArray(stop) ? stop : [stop];
+    }
+
+    if (outputMimeType) {
+        generationConfig.responseMimeType = outputMimeType;
     }
 
     // thinking config
@@ -456,10 +681,9 @@ export function convertOpenAIToAntigravity(openaiRequest, projectId = '', sessio
             }
         }
         request.request.tools = [{ functionDeclarations: declarations }];
+        const functionCallingConfig = resolveOpenAIToolChoiceConfig(tool_choice);
         request.request.toolConfig = {
-            functionCallingConfig: {
-                mode: tool_choice === 'none' ? 'NONE' : tool_choice === 'auto' ? 'AUTO' : 'VALIDATED'
-            }
+            functionCallingConfig
         };
     }
 
@@ -712,6 +936,7 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
             // tool_call
             if (part.functionCall) {
                 const callId = part.functionCall.id || `call_${uuidv4().slice(0, 8)}`;
+                openAIStreamToolCallSeen.set(stateKey, true);
                 const cleanedArgs = stripClaudeToolRequiredArgPlaceholderFromArgs(part.functionCall.args || {});
                 const sig = extractThoughtSignatureFromPart(part);
                 // 仅 Gemini 模型需要写入 toolThoughtSignatureCache
@@ -786,7 +1011,7 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
         }
 
         // finish
-        if (candidate.finishReason === 'STOP' || candidate.finishReason === 'MAX_TOKENS') {
+        if (candidate.finishReason) {
             flushClaudePendingToolCalls();
             claudeToolThinkingBuffer.delete(stateKey);
             if (OPENAI_THINKING_INCLUDE_TAGS && thinkingState.get(stateKey)) {
@@ -804,6 +1029,10 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
                 thinkingState.delete(stateKey);
             }
 
+            const finishReason = mapFinishReasonToOpenAIFinishReason(
+                candidate.finishReason,
+                openAIStreamToolCallSeen.get(stateKey) === true
+            );
             chunks.push({
                 id: `chatcmpl-${requestId}`,
                 object: 'chat.completion.chunk',
@@ -812,9 +1041,10 @@ export function convertSSEChunk(antigravityData, requestId, model, includeThinki
                 choices: [{
                     index: 0,
                     delta: {},
-                    finish_reason: candidate.finishReason === 'STOP' ? 'stop' : 'length'
+                    finish_reason: finishReason
                 }]
             });
+            openAIStreamToolCallSeen.delete(stateKey);
         }
 
         return chunks;
@@ -949,7 +1179,7 @@ export function convertResponse(antigravityResponse, requestId, model, includeTh
             choices: [{
                 index: 0,
                 message,
-                finish_reason: candidate.finishReason === 'STOP' ? 'stop' : 'length'
+                finish_reason: mapFinishReasonToOpenAIFinishReason(candidate.finishReason, toolCalls.length > 0)
             }],
             usage: {
                 prompt_tokens: usage?.promptTokenCount || 0,

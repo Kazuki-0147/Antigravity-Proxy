@@ -81,6 +81,7 @@ export default async function anthropicRoutes(fastify) {
                 const abortController = createAbortController(request);
 
                 const thinkingEnabledForStream = anthropicRequest.thinking?.type === 'enabled' ||
+                    anthropicRequest.thinking?.type === 'adaptive' ||
                     (anthropicRequest.thinking?.type !== 'disabled' && isThinkingModel(model));
                 let sseState = {
                     thinkingEnabled: !!thinkingEnabledForStream,
@@ -160,8 +161,81 @@ export default async function anthropicRoutes(fastify) {
                     reply.raw.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`);
                 }
 
-                // 上游偶发会“提前结束流”而不下发最终 finish/message_stop（客户端表现为：只输出一段 thinking 就断开）
-                // 这类情况对客户端来说是不可恢复的半包响应，这里明确返回 error event 方便前端重试/回滚。
+                // 上游偶发会“提前结束流”而不下发最终 finish/message_stop（客户端表现为：只输出一段 thinking 就断开）。
+                // 兜底策略：合成一个最终 finish chunk，尽量触发本地 converter 的 finalize 流程（flush deferred parts + message_stop）。
+                if (status === 'success' && !abortController.signal.aborted && sawAnyUpstreamEvents && !sseState?.completed) {
+                    try {
+                        const syntheticFinalizePayload = JSON.stringify({
+                            response: {
+                                candidates: [{
+                                    finishReason: 'OTHER',
+                                    content: { parts: [] }
+                                }],
+                                usageMetadata: {
+                                    promptTokenCount: sseState?.lastUsage?.input_tokens || lastUsage?.input_tokens || 0,
+                                    candidatesTokenCount: sseState?.lastUsage?.output_tokens || lastUsage?.output_tokens || 0
+                                }
+                            }
+                        });
+
+                        const finalizeResult = convertAntigravityToAnthropicSSE(
+                            syntheticFinalizePayload, requestId, model, sseState
+                        );
+                        if (finalizeResult && typeof finalizeResult === 'object') {
+                            const { events: finalizeEvents = [], state: finalizeState } = finalizeResult;
+                            sseState = finalizeState || sseState;
+
+                            for (const event of finalizeEvents) {
+                                const eventType = event.type;
+                                if (eventType === 'content_block_start' || eventType === 'content_block_delta') {
+                                    sawAnyContentBlock = true;
+                                }
+                                streamEventsForLog.push({ event: eventType, data: event });
+                                reply.raw.write(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+
+                                if (event.usage) {
+                                    lastUsage = event.usage;
+                                }
+                            }
+                        }
+                    } catch {
+                        // ignore synth-finalize failure, fallback to error below
+                    }
+                }
+
+                // 二级兜底：若 converter finalize 仍未完成，直接补最小 message_delta/message_stop，避免客户端 hard-fail。
+                if (status === 'success' && !abortController.signal.aborted && sawAnyUpstreamEvents && !sseState?.completed) {
+                    try {
+                        const fallbackUsage = {
+                            input_tokens: sseState?.lastUsage?.input_tokens || lastUsage?.input_tokens || 0,
+                            output_tokens: sseState?.lastUsage?.output_tokens || lastUsage?.output_tokens || 0
+                        };
+                        const fallbackStopReason = sseState?.hasToolUse ? 'tool_use' : 'end_turn';
+                        const fallbackEvents = [
+                            {
+                                type: 'message_delta',
+                                delta: {
+                                    stop_reason: fallbackStopReason,
+                                    stop_sequence: null
+                                },
+                                usage: fallbackUsage
+                            },
+                            { type: 'message_stop' }
+                        ];
+
+                        for (const event of fallbackEvents) {
+                            streamEventsForLog.push({ event: event.type, data: event });
+                            reply.raw.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+                        }
+
+                        sseState = { ...sseState, completed: true, lastUsage: fallbackUsage };
+                        lastUsage = fallbackUsage;
+                    } catch {
+                        // ignore hard-finalize failure, fallback to error below
+                    }
+                }
+
+                // 仍未完成：保持原错误语义
                 if (status === 'success' && !abortController.signal.aborted && sawAnyUpstreamEvents && !sseState?.completed) {
                     status = 'error';
                     errorMessage = 'Upstream stream ended unexpectedly (missing message_stop)';

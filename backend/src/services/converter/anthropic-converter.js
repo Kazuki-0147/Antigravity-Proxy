@@ -85,6 +85,113 @@ function detectModelFamily(model) {
     };
 }
 
+const THINKING_EFFORT_BUDGET_MAP = Object.freeze({
+    minimal: 1024,
+    low: 2048,
+    medium: DEFAULT_THINKING_BUDGET,
+    high: 8192,
+    max: 16384
+});
+
+function isClaude46Model(model) {
+    const name = normalizeModelName(model);
+    return name.includes('claude-opus-4-6') || name.includes('claude-4-6');
+}
+
+function normalizeAnthropicThinkingType(rawType) {
+    if (rawType === undefined || rawType === null) return null;
+    const value = String(rawType).trim().toLowerCase();
+    if (!value) return null;
+    if (value === 'enabled' || value === 'disabled' || value === 'adaptive') return value;
+    return null;
+}
+
+function normalizeAnthropicThinkingEffort(rawEffort) {
+    if (rawEffort === undefined || rawEffort === null) return null;
+    const value = String(rawEffort).trim().toLowerCase();
+    if (!value) return null;
+    return THINKING_EFFORT_BUDGET_MAP[value] ? value : null;
+}
+
+function resolveAnthropicThinkingSettings(model, thinking) {
+    const normalizedType = normalizeAnthropicThinkingType(thinking?.type);
+    const normalizedEffort = normalizeAnthropicThinkingEffort(thinking?.effort);
+    const thinkingEnabled = normalizedType === 'enabled' ||
+        normalizedType === 'adaptive' ||
+        (normalizedType !== 'disabled' && isThinkingModel(model));
+
+    const parsedBudget = Number(thinking?.budget_tokens ?? thinking?.budgetTokens);
+    const hasExplicitBudget = Number.isFinite(parsedBudget) && parsedBudget > 0;
+    const effortBudget = normalizedEffort ? THINKING_EFFORT_BUDGET_MAP[normalizedEffort] : null;
+    const rawBudget = hasExplicitBudget
+        ? Math.floor(parsedBudget)
+        : (effortBudget || DEFAULT_THINKING_BUDGET);
+
+    return {
+        thinkingEnabled,
+        thinkingType: normalizedType,
+        thinkingEffort: normalizedEffort,
+        rawBudget
+    };
+}
+
+function resolveAnthropicOutputFormat(outputConfig, legacyOutputFormat) {
+    const formatFromOutputConfig = outputConfig && typeof outputConfig === 'object'
+        ? outputConfig.format
+        : undefined;
+
+    if (typeof formatFromOutputConfig === 'string' && formatFromOutputConfig.trim()) {
+        return formatFromOutputConfig.trim();
+    }
+    if (typeof legacyOutputFormat === 'string' && legacyOutputFormat.trim()) {
+        return legacyOutputFormat.trim();
+    }
+    return null;
+}
+
+function mapOutputFormatToResponseMimeType(outputFormat) {
+    const normalized = String(outputFormat || '').trim().toLowerCase();
+    if (!normalized) return null;
+    if (normalized === 'json' || normalized === 'json_object' || normalized === 'json_schema') {
+        return 'application/json';
+    }
+    if (normalized === 'text') return 'text/plain';
+    if (normalized === 'markdown') return 'text/markdown';
+    return null;
+}
+
+function mapFinishReasonToAnthropicStopReason(finishReason, hasToolUse = false) {
+    if (hasToolUse) return 'tool_use';
+
+    const normalized = String(finishReason || '').trim().toUpperCase();
+    if (!normalized || normalized === 'STOP' || normalized === 'OTHER') return 'end_turn';
+
+    if (normalized === 'STOP_SEQUENCE') return 'stop_sequence';
+
+    if (normalized === 'MAX_TOKENS' || normalized === 'MAX_OUTPUT_TOKENS' || normalized === 'MODEL_CONTEXT_WINDOW_EXCEEDED') {
+        return 'max_tokens';
+    }
+
+    if (normalized === 'PAUSE' || normalized === 'PAUSE_TURN') return 'pause_turn';
+
+    if (
+        normalized === 'SAFETY' ||
+        normalized === 'BLOCKLIST' ||
+        normalized === 'PROHIBITED_CONTENT' ||
+        normalized === 'SPII' ||
+        normalized === 'IMAGE_SAFETY' ||
+        normalized === 'RECITATION' ||
+        normalized === 'LANGUAGE' ||
+        normalized === 'MALFORMED_FUNCTION_CALL' ||
+        normalized === 'UNEXPECTED_TOOL_CALL' ||
+        normalized === 'NO_IMAGE'
+    ) {
+        return 'refusal';
+    }
+
+    return 'end_turn';
+}
+
 function shouldWritebackClaudeLastSig(userKey) {
     if (!CLAUDE_LAST_SIG_WRITEBACK_ENABLED) return false;
     if (!userKey) return false;
@@ -296,7 +403,9 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         tools,
         tool_choice,
         stop_sequences,
-        thinking
+        thinking,
+        output_config,
+        output_format
     } = anthropicRequest;
 
     const toolOutputLimiter = createToolOutputLimiter({
@@ -305,17 +414,13 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         model: model || null
     });
 
-    // 检测 thinking 模式 - 显式启用或根据模型名自动启用
-    // 如果明确设置了 thinking.type，使用该设置；否则根据模型名判断
-    const thinkingEnabled = thinking?.type === 'enabled' ||
-        (thinking?.type !== 'disabled' && isThinkingModel(model));
+    const thinkingSettings = resolveAnthropicThinkingSettings(model, thinking);
+    const { thinkingEnabled, rawBudget } = thinkingSettings;
+    const normalizedOutputFormat = resolveAnthropicOutputFormat(output_config, output_format);
+    const outputMimeType = mapOutputFormatToResponseMimeType(normalizedOutputFormat);
 
     // Claude API 要求 budget_tokens >= 1024（且必须是有效的正整数）
     const MIN_THINKING_BUDGET = 1024;
-    const parsedBudget = Number(thinking?.budget_tokens);
-    const rawBudget = Number.isFinite(parsedBudget) && parsedBudget > 0
-        ? Math.floor(parsedBudget)
-        : DEFAULT_THINKING_BUDGET;
 
     const hasWebSearchTool = hasAnthropicWebSearchTool(tools);
     const userKey = anthropicRequest?.metadata?.user_id || null;
@@ -445,6 +550,10 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
         generationConfig.stopSequences = stop_sequences;
     }
 
+    if (outputMimeType) {
+        generationConfig.responseMimeType = outputMimeType;
+    }
+
     // 思维链配置 - 始终启用（如果请求中启用了）
     if (thinkingEnabled) {
         generationConfig.thinkingConfig = {
@@ -541,18 +650,32 @@ export function convertAnthropicToAntigravity(anthropicRequest, projectId = '', 
 	            request.request.tools = [{ functionDeclarations: declarations }];
 
             let toolMode = 'AUTO';
+            let allowedFunctionNames = null;
             if (tool_choice) {
-                if (tool_choice.type === 'none' || tool_choice === 'none') {
+                const toolChoiceType = typeof tool_choice === 'string' ? tool_choice : tool_choice.type;
+
+                if (toolChoiceType === 'none') {
                     toolMode = 'NONE';
-                } else if (tool_choice.type === 'any' || tool_choice === 'any') {
+                } else if (toolChoiceType === 'any') {
                     toolMode = 'ANY';
-                } else if (tool_choice.type === 'auto' || tool_choice === 'auto') {
+                } else if (toolChoiceType === 'auto') {
                     toolMode = 'AUTO';
+                } else if (toolChoiceType === 'tool') {
+                    const toolName = typeof tool_choice?.name === 'string' ? tool_choice.name.trim() : '';
+                    toolMode = 'ANY';
+                    if (toolName) {
+                        allowedFunctionNames = [toolName];
+                    }
                 }
             }
 
+            const functionCallingConfig = { mode: toolMode };
+            if (Array.isArray(allowedFunctionNames) && allowedFunctionNames.length > 0) {
+                functionCallingConfig.allowedFunctionNames = allowedFunctionNames;
+            }
+
             request.request.toolConfig = {
-                functionCallingConfig: { mode: toolMode }
+                functionCallingConfig
             };
         }
     }
@@ -1011,18 +1134,8 @@ export function convertAntigravityToAnthropic(antigravityResponse, requestId, mo
             for (const id of toolUseIds) if (id) cacheClaudeThinkingSignature(id, CLAUDE_THINKING_SIGNATURE_NO_THINKING_MARKER);
         }
 
-        // 确定 stop_reason
-        let stopReason = 'end_turn';
         const hasToolUse = content.some(c => c.type === 'tool_use');
-
-        if (hasToolUse) {
-            // 有工具调用时，stop_reason 应该是 tool_use
-            stopReason = 'tool_use';
-        } else if (candidate.finishReason === 'MAX_TOKENS') {
-            stopReason = 'max_tokens';
-        } else if (candidate.finishReason === 'STOP' || candidate.finishReason === 'OTHER') {
-            stopReason = 'end_turn';
-        }
+        const stopReason = mapFinishReasonToAnthropicStopReason(candidate.finishReason, hasToolUse);
 
         return {
             id: `msg_${requestId}`,
@@ -1597,11 +1710,8 @@ export function convertAntigravityToAnthropicSSE(antigravityData, requestId, mod
                 newState.inText = false;
             }
 
-            // 发送 message_delta - 根据是否有工具调用决定 stop_reason
-            let stopReason = 'end_turn';
-            if (newState.hasToolUse) stopReason = 'tool_use';
-            else if (finishReason === 'MAX_TOKENS') stopReason = 'max_tokens';
-            else if (finishReason === 'STOP_SEQUENCE') stopReason = 'stop_sequence';
+            // 发送 message_delta - 根据 finishReason/tool_use 映射 stop_reason
+            const stopReason = mapFinishReasonToAnthropicStopReason(finishReason, newState.hasToolUse);
 
             events.push({
                 type: 'message_delta',
@@ -1838,9 +1948,7 @@ export function preprocessAnthropicRequest(request) {
         didMutate = true;
     }
 
-    // 检测 thinking 模式 - 显式启用或根据模型名自动启用
-    const thinkingEnabled = request.thinking?.type === 'enabled' ||
-        (request.thinking?.type !== 'disabled' && isThinkingModel(request.model));
+    const thinkingEnabled = resolveAnthropicThinkingSettings(request.model, request.thinking).thinkingEnabled;
 
     if (!thinkingEnabled) {
         return didMutate ? { ...request, messages: sanitizedMessages } : request;
@@ -1856,6 +1964,8 @@ export function preprocessAnthropicRequest(request) {
     if (!preprocessModelInfo.isClaudeModel) {
         return didMutate ? { ...request, messages: sanitizedMessages } : request;
     }
+    const mappedModel = getMappedModel(request.model);
+    const isClaude46Request = isClaude46Model(request.model) || isClaude46Model(mappedModel);
 
     const extractSystemText = (sys) => {
         const texts = [];
@@ -1916,7 +2026,7 @@ export function preprocessAnthropicRequest(request) {
     // extended thinking 开启时，这会触发上游校验：final assistant message 必须以 thinking/redacted_thinking 开头。
     // 由于我们无法为该“人为注入的前缀”生成合法 signature，这里直接删除该前缀，并把约束挪到 system 提示中。
     const hasAnyAssistantJsonPrefix = workingMessages.some(isAssistantJsonPrefix);
-    if (looksLikeJsonOnlyInstruction || hasAnyAssistantJsonPrefix) {
+    if (isClaude46Request && (looksLikeJsonOnlyInstruction || hasAnyAssistantJsonPrefix)) {
         const filtered = [];
         let droppedPrefix = false;
         for (const m of workingMessages) {
@@ -1972,29 +2082,31 @@ export function preprocessAnthropicRequest(request) {
         return out;
     };
 
-    const lastMsg = workingMessages[workingMessages.length - 1];
-    if (lastMsg?.role === 'assistant' && !startsWithThinkingBlock(lastMsg)) {
-        const prefillText = extractAssistantPrefillText(lastMsg);
+    if (isClaude46Request) {
+        const lastMsg = workingMessages[workingMessages.length - 1];
+        if (lastMsg?.role === 'assistant' && !startsWithThinkingBlock(lastMsg)) {
+            const prefillText = extractAssistantPrefillText(lastMsg);
 
-        // 无论是否能提取出纯文本，都先移除这条 assistant prefill（否则上游必报错）
-        workingMessages = workingMessages.slice(0, -1);
-        didMutate = true;
+            // 无论是否能提取出纯文本，都先移除这条 assistant prefill（否则上游必报错）
+            workingMessages = workingMessages.slice(0, -1);
+            didMutate = true;
 
-        const trimmed = typeof prefillText === 'string' ? prefillText.trim() : '';
-        if (trimmed) {
-            // JSON 前缀已在上面处理过，这里只处理其它常见前缀（例如 "```json" / "{" 之外的格式约束）
-            const hint = `Start your response with the following prefix exactly (no extra characters before it): ${prefillText}`;
-            if (!extractSystemText(workingSystem).includes(hint)) {
-                if (Array.isArray(workingSystem)) {
-                    workingSystem = [...workingSystem, { type: 'text', text: hint }];
-                } else if (typeof workingSystem === 'string') {
-                    workingSystem = `${workingSystem}\n\n${hint}`;
-                } else if (workingSystem == null) {
-                    workingSystem = hint;
-                } else {
-                    // unknown shape, keep as-is
+            const trimmed = typeof prefillText === 'string' ? prefillText.trim() : '';
+            if (trimmed) {
+                // JSON 前缀已在上面处理过，这里只处理其它常见前缀（例如 "```json" / "{" 之外的格式约束）
+                const hint = `Start your response with the following prefix exactly (no extra characters before it): ${prefillText}`;
+                if (!extractSystemText(workingSystem).includes(hint)) {
+                    if (Array.isArray(workingSystem)) {
+                        workingSystem = [...workingSystem, { type: 'text', text: hint }];
+                    } else if (typeof workingSystem === 'string') {
+                        workingSystem = `${workingSystem}\n\n${hint}`;
+                    } else if (workingSystem == null) {
+                        workingSystem = hint;
+                    } else {
+                        // unknown shape, keep as-is
+                    }
+                    didMutate = true;
                 }
-                didMutate = true;
             }
         }
     }

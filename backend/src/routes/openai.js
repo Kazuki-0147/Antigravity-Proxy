@@ -23,9 +23,19 @@ export default async function openaiRoutes(fastify) {
         const startTime = Date.now();
         const openaiRequest = request.body;
         const { stream = false, model, thinking_budget, budget_tokens } = openaiRequest;
+        const thinkingType = String(openaiRequest?.thinking?.type || '').trim().toLowerCase();
+        const hasExplicitThinkingBudget =
+            thinking_budget !== undefined ||
+            budget_tokens !== undefined ||
+            openaiRequest?.thinking?.budget_tokens !== undefined ||
+            openaiRequest?.thinking?.budgetTokens !== undefined;
+        const hasThinkingEffort = openaiRequest?.thinking?.effort !== undefined;
         // Determine if we should include thinking output:
-        // Enable if model is a thinking model OR user explicitly passed thinking_budget/budget_tokens
-        const includeThinking = isThinkingModel(model) || thinking_budget !== undefined || budget_tokens !== undefined;
+        // Enable if explicit thinking.type enabled/adaptive; otherwise follow model default or explicit budget/effort.
+        const includeThinking =
+            thinkingType === 'enabled' ||
+            thinkingType === 'adaptive' ||
+            (thinkingType !== 'disabled' && (isThinkingModel(model) || hasExplicitThinkingBudget || hasThinkingEffort));
         const includeUsageInStream = !!(
             stream &&
             openaiRequest &&
