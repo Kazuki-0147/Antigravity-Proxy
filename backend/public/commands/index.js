@@ -9,6 +9,23 @@ import { api } from '../services/api.js';
 import { toast } from '../ui/toast.js';
 import { confirm } from '../ui/confirm.js';
 
+function clampThreshold(value, fallback = 0.2) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+}
+
+function mapThresholdSettings(raw) {
+  const src = raw?.quotaThresholds || raw || {};
+  return {
+    global: clampThreshold(src.global ?? raw?.groupQuotaMinThreshold, 0.2),
+    flash: clampThreshold(src.flash ?? raw?.flashGroupQuotaMinThreshold, 0.2),
+    pro: clampThreshold(src.pro ?? raw?.proGroupQuotaMinThreshold, 0.2),
+    claude: clampThreshold(src.claude ?? raw?.claudeGroupQuotaMinThreshold, 0.2),
+    image: clampThreshold(src.image ?? raw?.imageGroupQuotaMinThreshold, 0.2)
+  };
+}
+
 // ============ 认证命令 ============
 
 commands.register('auth:login', async ({ password, remember = true }) => {
@@ -74,16 +91,47 @@ commands.register('nav:change', async ({ tab }) => {
 
 commands.register('dashboard:load', async () => {
   store.set('dashboard.loading', true);
+  store.set('dashboard.settingsLoading', true);
   store.set('dashboard.error', null);
   
   try {
-    const data = await api.getDashboard();
-    store.set('dashboard.data', data);
+    const [data, settings] = await Promise.all([
+      api.getDashboard(),
+      api.getSettings()
+    ]);
+    store.batch(() => {
+      store.set('dashboard.data', data);
+      store.set('dashboard.settings', mapThresholdSettings(settings));
+    });
   } catch (error) {
     store.set('dashboard.error', error.message);
     throw error;
   } finally {
     store.set('dashboard.loading', false);
+    store.set('dashboard.settingsLoading', false);
+  }
+});
+
+commands.register('dashboard:save-thresholds', async ({ thresholds }) => {
+  const next = mapThresholdSettings(thresholds || {});
+  store.set('dashboard.settingsSaving', true);
+
+  try {
+    await Promise.all([
+      api.updateSetting('groupQuotaMinThreshold', next.global),
+      api.updateSetting('flashGroupQuotaMinThreshold', next.flash),
+      api.updateSetting('proGroupQuotaMinThreshold', next.pro),
+      api.updateSetting('claudeGroupQuotaMinThreshold', next.claude),
+      api.updateSetting('imageGroupQuotaMinThreshold', next.image)
+    ]);
+    store.set('dashboard.settings', next);
+    toast.success('Quota thresholds updated');
+    return true;
+  } catch (error) {
+    toast.error(error?.message || 'Failed to update thresholds');
+    throw error;
+  } finally {
+    store.set('dashboard.settingsSaving', false);
   }
 });
 

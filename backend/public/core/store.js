@@ -210,7 +210,16 @@ export const store = new Store({
   dashboard: {
     data: null,
     loading: false,
-    error: null
+    error: null,
+    settings: {
+      global: 0.2,
+      flash: 0.2,
+      pro: 0.2,
+      claude: 0.2,
+      image: 0.2
+    },
+    settingsLoading: false,
+    settingsSaving: false
   },
   
   // 账号管理

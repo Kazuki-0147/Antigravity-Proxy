@@ -1,4 +1,4 @@
-import { OAUTH_CONFIG, ANTIGRAVITY_CONFIG, AVAILABLE_MODELS, getMappedModel, isImageGenerationModel } from '../config.js';
+import { OAUTH_CONFIG, ANTIGRAVITY_CONFIG, AVAILABLE_MODELS, getMappedModel, isImageGenerationModel, getQuotaGroup, QUOTA_GROUPS } from '../config.js';
 import { updateAccountToken, updateAccountQuota, updateAccountStatus, updateAccountProjectId, updateAccountTier, updateAccountEmail, getAllAccountsForRefresh, upsertAccountModelQuota, getAccountByEmail, deleteAccount, cleanupOldLogs } from '../db/index.js';
 import { fingerprintFetch } from '../runtime/fingerprint-requester.js';
 import { ensureDeviceIdentity } from './deviceIdentity.js';
@@ -20,6 +20,47 @@ function toQuotaFraction(value, fallback = 0) {
     if (!Number.isFinite(num)) return fallback;
     // remainingFraction should be within [0, 1], clamp defensively
     return Math.max(0, Math.min(1, num));
+}
+
+function createGroupQuotaState() {
+    const groups = new Map();
+    for (const group of Object.values(QUOTA_GROUPS)) {
+        groups.set(group, {
+            sawSignal: false,
+            remainingFraction: 1,
+            resetTime: null
+        });
+    }
+    return groups;
+}
+
+function mergeGroupQuota(groups, modelId, remainingFraction, resetTime) {
+    const group = getQuotaGroup(modelId);
+    if (!group) return;
+
+    const nextRemaining = toQuotaFraction(remainingFraction, 0);
+    const entry = groups.get(group) || { sawSignal: false, remainingFraction: 1, resetTime: null };
+
+    if (!entry.sawSignal || nextRemaining < entry.remainingFraction) {
+        entry.remainingFraction = nextRemaining;
+        entry.resetTime = resetTime ?? null;
+    } else if (nextRemaining === entry.remainingFraction && entry.resetTime === null && resetTime !== null) {
+        entry.resetTime = resetTime;
+    }
+
+    entry.sawSignal = true;
+    groups.set(group, entry);
+}
+
+function persistGroupQuotaState(accountId, groups) {
+    for (const [group, entry] of groups.entries()) {
+        upsertAccountModelQuota(
+            accountId,
+            `group:${group}`,
+            entry.sawSignal ? entry.remainingFraction : 0,
+            entry.sawSignal ? entry.resetTime : null
+        );
+    }
 }
 
 function sleep(ms) {
@@ -324,6 +365,7 @@ export async function fetchQuotaInfo(account, model = null) {
         let minQuota = 1;
         let minQuotaResetTime = null;
         let sawQuotaSignal = false;
+        const groupQuotaState = createGroupQuotaState();
 
         const relevantEntries = Object.entries(models).filter(([modelId]) => QUOTA_RELEVANT_MODELS.has(modelId));
         const entriesToScan = relevantEntries.length > 0 ? relevantEntries : Object.entries(models);
@@ -341,6 +383,7 @@ export async function fetchQuotaInfo(account, model = null) {
                 if (isRelevant) {
                     sawQuotaSignal = true;
                     upsertAccountModelQuota(account.id, modelId, 0, null);
+                    mergeGroupQuota(groupQuotaState, modelId, 0, null);
                     if (shouldAffectOverall) {
                         minQuota = 0;
                         minQuotaResetTime = null;
@@ -355,6 +398,7 @@ export async function fetchQuotaInfo(account, model = null) {
 
             if (isRelevant) {
                 upsertAccountModelQuota(account.id, modelId, remainingFraction, resetTimestamp);
+                mergeGroupQuota(groupQuotaState, modelId, remainingFraction, resetTimestamp);
             }
 
             if (shouldAffectOverall && remainingFraction < minQuota) {
@@ -383,6 +427,7 @@ export async function fetchQuotaInfo(account, model = null) {
             minQuotaResetTime = null;
         }
 
+        persistGroupQuotaState(account.id, groupQuotaState);
         updateAccountQuota(account.id, minQuota, minQuotaResetTime);
 
         return selected || { remainingFraction: minQuota, resetTime: minQuotaResetTime };
@@ -425,6 +470,7 @@ export async function fetchDetailedQuotaInfo(account) {
         let minQuota = 1;
         let minQuotaResetTime = null;
         let sawQuotaSignal = false;
+        const groupQuotaState = createGroupQuotaState();
         const hasAnyRelevantModel = Object.keys(models).some((modelId) => QUOTA_RELEVANT_MODELS.has(modelId));
 
         for (const [modelId, modelInfo] of Object.entries(models)) {
@@ -440,6 +486,7 @@ export async function fetchDetailedQuotaInfo(account) {
                 if (isRelevant) {
                     sawQuotaSignal = true;
                     upsertAccountModelQuota(account.id, modelId, 0, null);
+                    mergeGroupQuota(groupQuotaState, modelId, 0, null);
                     quotas[modelId] = {
                         remainingFraction: 0,
                         resetTime: null,
@@ -461,6 +508,7 @@ export async function fetchDetailedQuotaInfo(account) {
 
             if (isRelevant) {
                 upsertAccountModelQuota(account.id, modelId, remainingFraction, resetTimestamp);
+                mergeGroupQuota(groupQuotaState, modelId, remainingFraction, resetTimestamp);
             }
 
             quotas[modelId] = {
@@ -481,6 +529,7 @@ export async function fetchDetailedQuotaInfo(account) {
             minQuotaResetTime = null;
         }
 
+        persistGroupQuotaState(account.id, groupQuotaState);
         // 更新账号的总体配额（使用最小值）
         updateAccountQuota(account.id, minQuota, minQuotaResetTime);
 

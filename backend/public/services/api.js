@@ -240,6 +240,19 @@ class ApiService {
     });
   }
 
+  async getSettings() {
+    return this.request('/admin/settings', {
+      dedupKey: 'admin-settings'
+    });
+  }
+
+  async updateSetting(key, value) {
+    return this.request('/admin/settings', {
+      method: 'PUT',
+      body: { key, value }
+    });
+  }
+
   // ============ 账号 API ============
 
   async getAccounts() {

@@ -132,6 +132,13 @@ export const MODEL_MAPPING = {
     'gemini-pro': 'gemini-2.5-pro'
 };
 
+export const QUOTA_GROUPS = Object.freeze({
+    FLASH: 'flash',
+    PRO: 'pro',
+    CLAUDE: 'claude',
+    IMAGE: 'image'
+});
+
 // 默认启用思维链的模型
 export const THINKING_MODELS = [
     'gemini-2.5-pro',
@@ -159,6 +166,43 @@ export function isImageGenerationModel(model) {
 // 获取实际发送的模型名称
 export function getMappedModel(model) {
     return MODEL_MAPPING[model] || model;
+}
+
+export function getQuotaGroup(model) {
+    const mapped = String(getMappedModel(model) || '').trim().toLowerCase();
+    if (!mapped) return null;
+
+    if (mapped.includes('image')) return QUOTA_GROUPS.IMAGE;
+    if (mapped.includes('claude')) return QUOTA_GROUPS.CLAUDE;
+    if (mapped.includes('gemini') && mapped.includes('pro')) return QUOTA_GROUPS.PRO;
+    if (mapped.includes('gemini') && mapped.includes('flash')) return QUOTA_GROUPS.FLASH;
+    return null;
+}
+
+function clampFraction(value, fallback = 0) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(0, Math.min(1, n));
+}
+
+export function getGroupQuotaThreshold(group = null) {
+    const globalThreshold = clampFraction(process.env.GROUP_QUOTA_MIN_THRESHOLD ?? 0.2, 0.2);
+    const key = String(group || '').trim().toLowerCase();
+    if (!key) return globalThreshold;
+
+    if (key === QUOTA_GROUPS.FLASH) {
+        return clampFraction(process.env.FLASH_GROUP_QUOTA_MIN_THRESHOLD ?? globalThreshold, globalThreshold);
+    }
+    if (key === QUOTA_GROUPS.PRO) {
+        return clampFraction(process.env.PRO_GROUP_QUOTA_MIN_THRESHOLD ?? globalThreshold, globalThreshold);
+    }
+    if (key === QUOTA_GROUPS.CLAUDE) {
+        return clampFraction(process.env.CLAUDE_GROUP_QUOTA_MIN_THRESHOLD ?? globalThreshold, globalThreshold);
+    }
+    if (key === QUOTA_GROUPS.IMAGE) {
+        return clampFraction(process.env.IMAGE_GROUP_QUOTA_MIN_THRESHOLD ?? globalThreshold, globalThreshold);
+    }
+    return globalThreshold;
 }
 
 // Safety settings：完整版（11 类）和基础版（5 类）

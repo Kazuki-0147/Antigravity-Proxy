@@ -1,4 +1,5 @@
 import { verifyAdmin } from '../middleware/auth.js';
+import { getGroupQuotaThreshold } from '../config.js';
 import {
     getAllAccounts, getAccountById, createAccount, updateAccountStatus, deleteAccount,
     getAllAccountsForRefresh,
@@ -21,6 +22,34 @@ function getDayStart(timestamp, offsetMinutes) {
     return d.getTime() - offsetMinutes * 60 * 1000;
 }
 
+function clampThresholdValue(value, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(0, Math.min(1, n));
+}
+
+const QUOTA_THRESHOLD_SETTING_KEYS = new Set([
+    'groupQuotaMinThreshold',
+    'flashGroupQuotaMinThreshold',
+    'proGroupQuotaMinThreshold',
+    'claudeGroupQuotaMinThreshold',
+    'imageGroupQuotaMinThreshold'
+]);
+const MISSING_SETTING = '__AGP_MISSING__';
+
+function resolveThresholdSetting(groupKey, envGroupDefault, envGlobalDefault) {
+    const globalRaw = getSetting('groupQuotaMinThreshold', MISSING_SETTING);
+    const groupRaw = groupKey ? getSetting(groupKey, MISSING_SETTING) : MISSING_SETTING;
+
+    if (groupRaw !== MISSING_SETTING) {
+        return clampThresholdValue(groupRaw, envGroupDefault);
+    }
+    if (globalRaw !== MISSING_SETTING) {
+        return clampThresholdValue(globalRaw, envGlobalDefault);
+    }
+    return clampThresholdValue(envGroupDefault, envGlobalDefault);
+}
+
 export default async function adminRoutes(fastify) {
     // 所有管理路由需要认证
     fastify.addHook('preHandler', verifyAdmin);
@@ -38,6 +67,7 @@ export default async function adminRoutes(fastify) {
         const modelAttemptUsage = getModelAttemptUsageStats(todayStart, now); // 模型请求次数（基于 attempt）
         const modelTokenUsage = getModelUsageStats(todayStart, now);          // 模型 token（基于 request）
         const poolStats = accountPool.getPoolStats();
+        const routing = accountPool.getGroupRoutingOverview();
 
         // 合并模型统计：次数用 attempt 表，token 用 request 表
         const tokenMap = new Map(modelTokenUsage.map(m => [m.model, m.tokens || 0]));
@@ -62,7 +92,8 @@ export default async function adminRoutes(fastify) {
                 avgLatency: Math.round(todayAttemptStats.avg_latency || 0)
             },
             modelUsage,
-            pool: poolStats
+            pool: poolStats,
+            routing
         };
     });
 
@@ -368,9 +399,26 @@ export default async function adminRoutes(fastify) {
 
     // GET /admin/settings
     fastify.get('/admin/settings', async () => {
+        const envGlobal = getGroupQuotaThreshold();
+        const globalThreshold = clampThresholdValue(getSetting('groupQuotaMinThreshold', envGlobal), envGlobal);
+        const flashThreshold = resolveThresholdSetting('flashGroupQuotaMinThreshold', getGroupQuotaThreshold('flash'), envGlobal);
+        const proThreshold = resolveThresholdSetting('proGroupQuotaMinThreshold', getGroupQuotaThreshold('pro'), envGlobal);
+        const claudeThreshold = resolveThresholdSetting('claudeGroupQuotaMinThreshold', getGroupQuotaThreshold('claude'), envGlobal);
+        const imageThreshold = resolveThresholdSetting('imageGroupQuotaMinThreshold', getGroupQuotaThreshold('image'), envGlobal);
+
         return {
-            defaultModel: getSetting('defaultModel', 'gemini-2.5-flash'),
-            pollingStrategy: getSetting('pollingStrategy', 'weighted')
+            groupQuotaMinThreshold: globalThreshold,
+            flashGroupQuotaMinThreshold: flashThreshold,
+            proGroupQuotaMinThreshold: proThreshold,
+            claudeGroupQuotaMinThreshold: claudeThreshold,
+            imageGroupQuotaMinThreshold: imageThreshold,
+            quotaThresholds: {
+                global: globalThreshold,
+                flash: flashThreshold,
+                pro: proThreshold,
+                claude: claudeThreshold,
+                image: imageThreshold
+            }
         };
     });
 
@@ -380,6 +428,20 @@ export default async function adminRoutes(fastify) {
 
         if (!key) {
             return { error: { message: 'key is required' } };
+        }
+
+        if (QUOTA_THRESHOLD_SETTING_KEYS.has(key)) {
+            const fallback = key === 'groupQuotaMinThreshold'
+                ? getGroupQuotaThreshold()
+                : key === 'flashGroupQuotaMinThreshold'
+                    ? getGroupQuotaThreshold('flash')
+                    : key === 'proGroupQuotaMinThreshold'
+                        ? getGroupQuotaThreshold('pro')
+                        : key === 'claudeGroupQuotaMinThreshold'
+                            ? getGroupQuotaThreshold('claude')
+                            : getGroupQuotaThreshold('image');
+            setSetting(key, clampThresholdValue(value, fallback));
+            return { success: true };
         }
 
         setSetting(key, value);

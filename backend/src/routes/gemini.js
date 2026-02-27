@@ -7,7 +7,7 @@ import { streamChat, chat, countTokens, fetchAvailableModels } from '../services
 import { createRequestLog } from '../db/index.js';
 import { getMappedModel, getSafetySettings } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
-import { isCapacityError, isAuthenticationError, parseResetAfterMs, SSE_HEADERS, buildErrorMessage } from '../utils/route-helpers.js';
+import { isCapacityError, isAuthenticationError, isServerCapacityExhaustedError, parseResetAfterMs, SSE_HEADERS, buildErrorMessage } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry, runChatWithCapacityRetry, runStreamChatWithCapacityRetry } from '../utils/request-handler.js';
 import { buildUpstreamSystemInstruction } from '../services/converter/system-instruction.js';
 import { sendTrajectoryAnalytics } from '../services/trajectory.js';
@@ -403,14 +403,15 @@ export default async function geminiRoutes(fastify) {
 
                 const msg = error.message || '';
                 const capacity = isCapacityError(error);
+                const serverCapacityExhausted = isServerCapacityExhaustedError(error);
                 const authError = isAuthenticationError(error);
                 const retryAfterMs = Number.isFinite(error?.retryAfterMs)
                     ? error.retryAfterMs
                     : parseResetAfterMs(error?.message);
 
-                if (account && capacity) {
+                if (account && capacity && !serverCapacityExhausted) {
                     accountPool.markCapacityLimited(account.id, model, msg);
-                } else if (account && !authError && !error?.authHandled) {
+                } else if (account && !capacity && !authError && !error?.authHandled) {
                     accountPool.markAccountError(account.id, error);
                 }
 

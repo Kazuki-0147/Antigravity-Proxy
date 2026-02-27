@@ -112,8 +112,39 @@ export function getAllAccountsForRefresh() {
 }
 
 // 兼容：按模型选择可用账号（同一账号不同模型配额可能不同）
-export function getActiveAccounts(model = null) {
+export function getActiveAccounts(model = null, options = null) {
+    const minQuotaRemaining = Math.max(0, Number(options?.minQuotaRemaining ?? 0));
+
     if (model) {
+        const isGroupKey = String(model).startsWith('group:');
+        if (isGroupKey) {
+            return getDatabase().prepare(`
+                SELECT
+                    a.id,
+                    a.email,
+                    a.refresh_token,
+                    a.access_token,
+                    a.token_expires_at,
+                    a.project_id,
+                    a.tier,
+                    a.status,
+                    COALESCE(q.quota_remaining, 0) AS quota_remaining,
+                    q.quota_reset_time AS quota_reset_time,
+                    a.last_used_at,
+                    a.error_count,
+                    a.last_error,
+                    a.created_at
+                FROM accounts a
+                LEFT JOIN account_model_quotas q
+                    ON q.account_id = a.id AND q.model = ?
+                WHERE a.status = 'active'
+                    AND COALESCE(q.quota_remaining, 0) >= ?
+                ORDER BY
+                    COALESCE(q.quota_remaining, 0) DESC,
+                    a.last_used_at ASC
+            `).all(model, minQuotaRemaining);
+        }
+
         return getDatabase().prepare(`
             SELECT
                 a.id,
@@ -134,19 +165,19 @@ export function getActiveAccounts(model = null) {
             LEFT JOIN account_model_quotas q
                 ON q.account_id = a.id AND q.model = ?
             WHERE a.status = 'active'
-                AND (q.quota_remaining IS NULL OR q.quota_remaining > 0)
+                AND (q.quota_remaining IS NULL OR q.quota_remaining > ?)
             ORDER BY
                 CASE WHEN q.quota_remaining IS NULL THEN 1 ELSE 0 END ASC,
                 COALESCE(q.quota_remaining, a.quota_remaining) DESC,
                 a.last_used_at ASC
-        `).all(model);
+        `).all(model, minQuotaRemaining);
     }
 
     return getDatabase().prepare(`
         SELECT * FROM accounts
-        WHERE status = 'active' AND quota_remaining > 0
+        WHERE status = 'active' AND quota_remaining > ?
         ORDER BY quota_remaining DESC, last_used_at ASC
-    `).all();
+    `).all(minQuotaRemaining);
 }
 
 export function upsertAccountModelQuota(accountId, model, quotaRemaining, quotaResetTime) {

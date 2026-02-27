@@ -1,6 +1,6 @@
-import { getActiveAccounts, updateAccountLastUsed, updateAccountStatus, updateAccountQuota } from '../db/index.js';
+import { getActiveAccounts, getAccountById, updateAccountLastUsed, updateAccountStatus, updateAccountQuota, getSetting } from '../db/index.js';
 import { ensureValidToken, fetchQuotaInfo } from './tokenManager.js';
-import { RETRY_CONFIG, getMappedModel } from '../config.js';
+import { RETRY_CONFIG, QUOTA_GROUPS, getMappedModel, getQuotaGroup, getGroupQuotaThreshold } from '../config.js';
 
 function parseBoolean(value, defaultValue = false) {
     if (value === undefined || value === null || value === '') return defaultValue;
@@ -17,18 +17,169 @@ const MAX_CONCURRENT_PER_ACCOUNT = Number(process.env.MAX_CONCURRENT_PER_ACCOUNT
 // 容量耗尽后的默认冷却时间（毫秒），如果上游返回了具体秒数，会在此基础上调整
 const CAPACITY_COOLDOWN_DEFAULT_MS = Number(process.env.CAPACITY_COOLDOWN_DEFAULT_MS || 15000);
 const CAPACITY_COOLDOWN_MAX_MS = Number(process.env.CAPACITY_COOLDOWN_MAX_MS || 120000);
+const MISSING_SETTING = '__AGP_MISSING__';
+
+const GROUP_THRESHOLD_SETTING_KEY = Object.freeze({
+    flash: 'flashGroupQuotaMinThreshold',
+    pro: 'proGroupQuotaMinThreshold',
+    claude: 'claudeGroupQuotaMinThreshold',
+    image: 'imageGroupQuotaMinThreshold'
+});
+
+function clampThresholdValue(value, fallback = 0.2) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(0, Math.min(1, n));
+}
 
 /**
  * 账号池管理类
- * 实现加权轮询策略，优先使用配额多的账号
+ * 实现配额优先策略，尽量先消耗高配额账号
  */
 class AccountPool {
     constructor() {
         this.lastUsedAccountId = 0; // 全局跟踪上次使用的账号 ID（跨模型共享）
+        this.preferredAccountBySelection = new Map(); // 每个分组/模型的粘性账号 key: selectionKey -> accountId
         this.accountLocks = new Map(); // 账号锁，防止并发问题（值为当前并发计数）
         this.capacityCooldowns = new Map(); // 账号在某个模型上的冷却期 key: `${accountId}:${model}` -> timestamp
         this.capacityErrorCounts = new Map(); // 连续容量错误计数 key: `${accountId}:${model}` -> count
         this.errorCounts = new Map(); // 账号错误计数（非容量错误）key: accountId -> count
+    }
+
+    resolveSelectionContext(model = null) {
+        const mappedModel = model ? getMappedModel(model) : null;
+        const quotaGroup = mappedModel ? getQuotaGroup(mappedModel) : null;
+        const selectionKey = quotaGroup ? `group:${quotaGroup}` : mappedModel;
+        const minQuotaThreshold = quotaGroup ? this.getDynamicGroupThreshold(quotaGroup) : 0;
+        return { mappedModel, quotaGroup, selectionKey, minQuotaThreshold };
+    }
+
+    getDynamicGroupThreshold(quotaGroup) {
+        if (!quotaGroup) return 0;
+
+        const envGroupDefault = getGroupQuotaThreshold(quotaGroup);
+        const envGlobalDefault = getGroupQuotaThreshold();
+
+        const groupSettingKey = GROUP_THRESHOLD_SETTING_KEY[quotaGroup] || null;
+        const globalRaw = getSetting('groupQuotaMinThreshold', MISSING_SETTING);
+        const groupRaw = groupSettingKey ? getSetting(groupSettingKey, MISSING_SETTING) : MISSING_SETTING;
+
+        if (groupRaw !== MISSING_SETTING) {
+            return clampThresholdValue(groupRaw, envGroupDefault);
+        }
+        if (globalRaw !== MISSING_SETTING) {
+            return clampThresholdValue(globalRaw, envGlobalDefault);
+        }
+        return clampThresholdValue(envGroupDefault, envGlobalDefault);
+    }
+
+    normalizeCapacityKey(model) {
+        if (!model) return null;
+        const raw = String(model);
+        if (raw.startsWith('group:')) return raw;
+        const mappedModel = getMappedModel(raw);
+        const quotaGroup = getQuotaGroup(mappedModel);
+        return quotaGroup ? `group:${quotaGroup}` : mappedModel;
+    }
+
+    getCapacityCacheKey(accountId, model) {
+        const normalized = this.normalizeCapacityKey(model);
+        if (!accountId || !normalized) return null;
+        return `${accountId}:${normalized}`;
+    }
+
+    getThresholdRetryAfterMs(accounts) {
+        let earliestReset = null;
+        for (const account of accounts) {
+            const resetAt = Number(account?.quota_reset_time);
+            if (!Number.isFinite(resetAt) || resetAt <= Date.now()) continue;
+            if (!earliestReset || resetAt < earliestReset) earliestReset = resetAt;
+        }
+        if (!earliestReset) return null;
+        return Math.max(0, earliestReset - Date.now());
+    }
+
+    createThresholdError(quotaGroup, minQuotaThreshold, accounts) {
+        const retryAfterMs = this.getThresholdRetryAfterMs(accounts);
+        const thresholdPct = Math.max(0, minQuotaThreshold * 100);
+        const thresholdText = Number.isInteger(thresholdPct) ? `${thresholdPct}` : thresholdPct.toFixed(1);
+        const groupName = quotaGroup || 'requested model';
+
+        let message = `No account above ${thresholdText}% quota for ${groupName}`;
+        if (Number.isFinite(retryAfterMs)) {
+            const seconds = Math.max(0, Math.ceil(retryAfterMs / 1000));
+            const messageSeconds = Math.max(0, seconds - 1);
+            message += `, reset after ${messageSeconds}s`;
+        }
+
+        const err = new Error(message);
+        err.upstreamStatus = 429;
+        if (Number.isFinite(retryAfterMs)) {
+            err.retryAfterMs = retryAfterMs;
+        }
+        return err;
+    }
+
+    getGroupRoutingOverview() {
+        const groups = Object.values(QUOTA_GROUPS);
+        const result = [];
+
+        for (const group of groups) {
+            const selectionKey = `group:${group}`;
+            const minQuotaThreshold = this.getDynamicGroupThreshold(group);
+            const accounts = getActiveAccounts(selectionKey, { minQuotaRemaining: 0 });
+            const eligible = accounts
+                .filter((a) => Number(a?.quota_remaining) > minQuotaThreshold)
+                .sort((a, b) => {
+                    if (Number(b.quota_remaining) !== Number(a.quota_remaining)) {
+                        return Number(b.quota_remaining) - Number(a.quota_remaining);
+                    }
+                    return (a.id || 0) - (b.id || 0);
+                });
+
+            const stickyRaw = Number(this.preferredAccountBySelection.get(selectionKey));
+            const stickyId = Number.isFinite(stickyRaw) && stickyRaw > 0 ? stickyRaw : null;
+            const stickyEligible = stickyId
+                ? eligible.find((a) => Number(a?.id) === stickyId) || null
+                : null;
+            const stickyActive = stickyId
+                ? accounts.find((a) => Number(a?.id) === stickyId) || null
+                : null;
+
+            let stickyAccount = stickyActive || null;
+            if (!stickyAccount && stickyId) {
+                stickyAccount = getAccountById(stickyId) || null;
+            }
+
+            const current = stickyEligible || eligible[0] || null;
+            const switchRequired = !!stickyId && !stickyEligible;
+
+            result.push({
+                group,
+                selectionKey,
+                threshold: minQuotaThreshold,
+                eligibleCount: eligible.length,
+                sticky: stickyId
+                    ? {
+                        id: stickyId,
+                        email: stickyAccount?.email || null,
+                        status: stickyAccount?.status || null,
+                        active: !!stickyActive,
+                        eligible: !!stickyEligible,
+                        switchRequired
+                    }
+                    : null,
+                currentAccount: current
+                    ? {
+                        id: Number(current.id),
+                        email: current.email || null,
+                        quotaRemaining: Number(current.quota_remaining)
+                    }
+                    : null
+            });
+        }
+
+        return result;
     }
 
     /**
@@ -39,87 +190,26 @@ class AccountPool {
      * 3. 如果配额相同，选择最近最少使用的账号
      */
     async getBestAccount(model = null) {
-        const mappedModel = model ? getMappedModel(model) : null;
-        const accounts = getActiveAccounts(mappedModel);
-
-        if (accounts.length === 0) {
-            throw new Error('No active accounts available');
-        }
-
-        let earliestCooldownUntil = null;
-        let cooldownCount = 0;
-
-        // 按配额降序、最后使用时间升序排序
-        accounts.sort((a, b) => {
-            // 首先按配额排序
-            if (b.quota_remaining !== a.quota_remaining) {
-                return b.quota_remaining - a.quota_remaining;
-            }
-            // 配额相同时，优先使用最久未使用的账号
-            return (a.last_used_at || 0) - (b.last_used_at || 0);
-        });
-
-        // 尝试找到一个可用的账号
-        for (const account of accounts) {
-            // 检查账号并发是否已满
-            if (!DISABLE_LOCAL_LIMITS && Number.isFinite(MAX_CONCURRENT_PER_ACCOUNT) && MAX_CONCURRENT_PER_ACCOUNT > 0) {
-                const lockCount = this.accountLocks.get(account.id) || 0;
-                if (lockCount >= MAX_CONCURRENT_PER_ACCOUNT) {
-                    continue;
-                }
-            }
-
-            // 检查是否处于容量冷却期
-            if (!DISABLE_LOCAL_LIMITS && mappedModel && this.isAccountInCooldown(account.id, mappedModel)) {
-                cooldownCount += 1;
-                const until = this.capacityCooldowns.get(`${account.id}:${mappedModel}`);
-                if (until && (!earliestCooldownUntil || until < earliestCooldownUntil)) {
-                    earliestCooldownUntil = until;
-                }
-                continue;
-            }
-
-            try {
-                // 确保 token 有效
-                const validAccount = await ensureValidToken(account);
-
-                // 锁定账号并发
-                this.lockAccount(account.id);
-
-                // 更新最后使用时间
-                updateAccountLastUsed(account.id);
-
-                return validAccount;
-            } catch (err) {
-                console.error(`[ACCOUNT_POOL] getBestAccount ensureValidToken failed for account ${account.id} (${account.email}):`, err.message);
-                // 继续尝试下一个账号
-            }
-        }
-
-        // 所有账号都在冷却期：返回 429 + reset after，便于客户端等待后重试
-        if (!DISABLE_LOCAL_LIMITS && mappedModel && cooldownCount === accounts.length && earliestCooldownUntil) {
-            const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
-            const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
-            const messageSeconds = Math.max(0, seconds - 1);
-            const err = new Error(`No capacity available, reset after ${messageSeconds}s`);
-            err.upstreamStatus = 429;
-            err.retryAfterMs = remainingMs;
-            throw err;
-        }
-
-        throw new Error('No available accounts with valid tokens');
+        return this.getNextAccount(model);
     }
 
     /**
-     * 轮询获取账号（全局严格轮询，跨模型共享索引）
-     * 使用账号 ID 而非数组索引跟踪，避免不同模型账号池大小不同导致的错位
+     * 获取下一个账号（按组配额优先）
      */
     async getNextAccount(model = null, options = null) {
-        const mappedModel = model ? getMappedModel(model) : null;
-        const accounts = getActiveAccounts(mappedModel);
+        const { quotaGroup, selectionKey, minQuotaThreshold } = this.resolveSelectionContext(model);
+        const accounts = getActiveAccounts(selectionKey, { minQuotaRemaining: 0 });
 
         if (accounts.length === 0) {
+            if (selectionKey) this.preferredAccountBySelection.delete(selectionKey);
             throw new Error('No active accounts available');
+        }
+
+        const thresholdCandidates = accounts.filter((a) => Number(a?.quota_remaining) > minQuotaThreshold);
+
+        if (thresholdCandidates.length === 0) {
+            if (selectionKey) this.preferredAccountBySelection.delete(selectionKey);
+            throw this.createThresholdError(quotaGroup, minQuotaThreshold, accounts);
         }
 
         const excludeIds = new Set();
@@ -138,44 +228,30 @@ class AccountPool {
         let earliestCooldownUntil = null;
         let cooldownCount = 0;
 
-        // 严格轮询：按 ID 排序，保证稳定顺序
-        const ordered = [...accounts].sort((a, b) => (a.id || 0) - (b.id || 0));
-        const total = ordered.length;
-
-        // 注意：必须“按最终尝试的账号”推进 lastUsedAccountId。
-        // 否则当某个账号因 token/cooldown/并发等原因被跳过时，
-        // lastUsedAccountId 仍停留在被跳过的账号上，下一次请求会再次命中同一个“下一个可用账号”，
-        // 从而出现“连续两次使用同一账号”的现象。
-        //
-        // 这里采用“逐个预占位（reservation）”的方式：
-        // 每次尝试一个账号前，立即把 lastUsedAccountId 推进到该账号（无 await），
-        // 保证并发下不会因异步完成顺序导致指针回退，同时也能在跳过账号时继续向前推进。
-        const tried = new Set();
-
-        for (let attempt = 0; attempt < total; attempt++) {
-            const prevId = this.lastUsedAccountId;
-            let startIdx = ordered.findIndex(a => a.id > prevId);
-            if (startIdx === -1) startIdx = 0;
-
-            let account = null;
-            for (let offset = 0; offset < total; offset++) {
-                const idx = (startIdx + offset) % total;
-                const candidate = ordered[idx];
-                const candidateId = candidate?.id;
-                if (!candidateId || tried.has(candidateId)) continue;
-                if (excludeIds.has(candidateId)) continue;
-                account = candidate;
-                break;
+        const sortedByQuota = [...thresholdCandidates].sort((a, b) => {
+            if (Number(b.quota_remaining) !== Number(a.quota_remaining)) {
+                return Number(b.quota_remaining) - Number(a.quota_remaining);
             }
+            return (a.id || 0) - (b.id || 0);
+        });
 
-            if (!account) break;
+        // 粘性账号策略：同一配额分组内，优先持续使用上一次成功账号，
+        // 直到它低于阈值/不可用，再切换到新的高配额账号。
+        const preferredId = Number(selectionKey ? this.preferredAccountBySelection.get(selectionKey) : 0);
+        const preferredAccount = Number.isFinite(preferredId) && preferredId > 0
+            ? sortedByQuota.find((a) => Number(a?.id) === preferredId)
+            : null;
+        const ordered = preferredAccount
+            ? [preferredAccount, ...sortedByQuota.filter((a) => Number(a?.id) !== preferredId)]
+            : sortedByQuota;
 
-            const candidateId = account.id;
-            tried.add(candidateId);
+        let consideredCount = 0;
 
-            // 乐观更新：立即推进 lastUsedAccountId（无 await），避免并发竞争与“跳号导致重复命中”
-            this.lastUsedAccountId = candidateId;
-            console.log(`[POLL] ts=${Date.now()} prev=${prevId} next=${candidateId} model=${mappedModel}`);
+        for (const account of ordered) {
+            const candidateId = Number(account?.id);
+            if (!Number.isFinite(candidateId) || candidateId <= 0) continue;
+            if (excludeIds.has(candidateId)) continue;
+            consideredCount += 1;
 
             // 检查账号并发是否已满
             if (!DISABLE_LOCAL_LIMITS && Number.isFinite(MAX_CONCURRENT_PER_ACCOUNT) && MAX_CONCURRENT_PER_ACCOUNT > 0) {
@@ -186,9 +262,10 @@ class AccountPool {
             }
 
             // 检查是否处于容量冷却期
-            if (!DISABLE_LOCAL_LIMITS && mappedModel && this.isAccountInCooldown(account.id, mappedModel)) {
+            if (!DISABLE_LOCAL_LIMITS && selectionKey && this.isAccountInCooldown(account.id, selectionKey)) {
                 cooldownCount += 1;
-                const until = this.capacityCooldowns.get(`${account.id}:${mappedModel}`);
+                const cooldownKey = this.getCapacityCacheKey(account.id, selectionKey);
+                const until = cooldownKey ? this.capacityCooldowns.get(cooldownKey) : null;
                 if (until && (!earliestCooldownUntil || until < earliestCooldownUntil)) {
                     earliestCooldownUntil = until;
                 }
@@ -203,16 +280,21 @@ class AccountPool {
 
                 // 更新最后使用时间
                 updateAccountLastUsed(account.id);
+                this.lastUsedAccountId = candidateId;
+                if (selectionKey) this.preferredAccountBySelection.set(selectionKey, candidateId);
 
                 return validAccount;
             } catch (err) {
                 console.error(`[ACCOUNT_POOL] ensureValidToken failed for account ${account.id} (${account.email}):`, err.message);
+                if (selectionKey && preferredId === candidateId) {
+                    this.preferredAccountBySelection.delete(selectionKey);
+                }
                 // 继续尝试下一个账号
             }
         }
 
         // 所有账号都在冷却期：返回 429 + reset after，便于客户端等待后重试
-        if (!DISABLE_LOCAL_LIMITS && mappedModel && cooldownCount === total && earliestCooldownUntil) {
+        if (!DISABLE_LOCAL_LIMITS && selectionKey && consideredCount > 0 && cooldownCount === consideredCount && earliestCooldownUntil) {
             const remainingMs = Math.max(0, earliestCooldownUntil - Date.now());
             const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
             const messageSeconds = Math.max(0, seconds - 1);
@@ -303,14 +385,13 @@ class AccountPool {
      */
     markCapacityLimited(accountId, model, message) {
         if (DISABLE_LOCAL_LIMITS) return;
-        const mappedModel = model ? getMappedModel(model) : null;
-        if (!accountId || !mappedModel) return;
+        const cacheKey = this.getCapacityCacheKey(accountId, model);
+        if (!cacheKey) return;
 
         let cooldownMs = CAPACITY_COOLDOWN_DEFAULT_MS;
-        const key = `${accountId}:${mappedModel}`;
-        const prev = this.capacityErrorCounts.get(key) || 0;
+        const prev = this.capacityErrorCounts.get(cacheKey) || 0;
         const next = prev + 1;
-        this.capacityErrorCounts.set(key, next);
+        this.capacityErrorCounts.set(cacheKey, next);
 
         // 指数退避：默认冷却 * 2^(n-1)，上限 CAPACITY_COOLDOWN_MAX_MS
         if (CAPACITY_COOLDOWN_DEFAULT_MS > 0) {
@@ -331,7 +412,7 @@ class AccountPool {
         }
 
         const until = Date.now() + cooldownMs;
-        this.capacityCooldowns.set(key, until);
+        this.capacityCooldowns.set(cacheKey, until);
         return cooldownMs;
     }
 
@@ -340,10 +421,9 @@ class AccountPool {
      */
     markCapacityRecovered(accountId, model) {
         if (DISABLE_LOCAL_LIMITS) return;
-        const mappedModel = model ? getMappedModel(model) : null;
-        if (!accountId || !mappedModel) return;
-        const key = `${accountId}:${mappedModel}`;
-        this.capacityErrorCounts.delete(key);
+        const cacheKey = this.getCapacityCacheKey(accountId, model);
+        if (!cacheKey) return;
+        this.capacityErrorCounts.delete(cacheKey);
     }
 
     /**
@@ -351,10 +431,9 @@ class AccountPool {
      */
     isAccountInCooldown(accountId, model) {
         if (DISABLE_LOCAL_LIMITS) return false;
-        const mappedModel = model ? getMappedModel(model) : null;
-        if (!accountId || !mappedModel) return false;
-        const key = `${accountId}:${mappedModel}`;
-        const until = this.capacityCooldowns.get(key);
+        const cacheKey = this.getCapacityCacheKey(accountId, model);
+        if (!cacheKey) return false;
+        const until = this.capacityCooldowns.get(cacheKey);
         if (!until) return false;
 
         if (Date.now() < until) {
@@ -362,7 +441,7 @@ class AccountPool {
         }
 
         // 冷却已过期，清理
-        this.capacityCooldowns.delete(key);
+        this.capacityCooldowns.delete(cacheKey);
         return false;
     }
 
@@ -385,9 +464,9 @@ class AccountPool {
      * 获取当前可用账号数量（active 且 quota > 0）
      */
     getAvailableAccountCount(model = null) {
-        const mappedModel = model ? getMappedModel(model) : null;
-        const accounts = getActiveAccounts(mappedModel);
-        return accounts.length;
+        const { selectionKey, minQuotaThreshold } = this.resolveSelectionContext(model);
+        const accounts = getActiveAccounts(selectionKey, { minQuotaRemaining: 0 });
+        return accounts.filter((a) => Number(a?.quota_remaining) > minQuotaThreshold).length;
     }
 
     /**

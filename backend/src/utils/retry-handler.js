@@ -139,16 +139,18 @@ export async function withCapacityRetry({
     getAccount,
     executeRequest,
     onCapacityError,
-    canRetry
+    canRetry,
+    reuseSameAccountOnRetry
 }) {
     const max = Math.max(0, Number(maxRetries || 0));
     const baseDelay = Math.max(0, Number(baseRetryDelayMs || 0));
 
     let attempt = 0;
+    let currentAccount = null;
 
     while (true) {
         attempt += 1;
-        const account = getAccount ? await getAccount({ attempt }) : null;
+        const account = currentAccount || (getAccount ? await getAccount({ attempt }) : null);
 
         try {
             const result = await executeRequest({ attempt, account });
@@ -169,6 +171,11 @@ export async function withCapacityRetry({
             const shouldRetry = capacity && allowedByCount && allowedByHook;
 
             if (!shouldRetry) throw error;
+
+            const shouldReuseSameAccount = capacity && typeof reuseSameAccountOnRetry === 'function'
+                ? !!reuseSameAccountOnRetry({ attempt, maxRetries: max, account, error, capacity })
+                : false;
+            currentAccount = shouldReuseSameAccount ? account : null;
 
             const resetMs = parseResetAfterMs(error?.message);
             const delay = resetMs ?? (baseDelay * attempt);

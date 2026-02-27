@@ -11,7 +11,7 @@ import {
 import { createRequestLog } from '../db/index.js';
 import { isThinkingModel, AVAILABLE_MODELS } from '../config.js';
 import { logModelCall } from '../services/modelLogger.js';
-import { isCapacityError, isAuthenticationError, parseResetAfterMs, SSE_HEADERS_ANTHROPIC, buildErrorMessage } from '../utils/route-helpers.js';
+import { isCapacityError, isAuthenticationError, isServerCapacityExhaustedError, parseResetAfterMs, SSE_HEADERS_ANTHROPIC, buildErrorMessage } from '../utils/route-helpers.js';
 import { createAbortController, runChatWithFullRetry, runStreamChatWithFullRetry } from '../utils/request-handler.js';
 import { sendTrajectoryAnalytics } from '../services/trajectory.js';
 import { sendRequestMetrics } from '../services/telemetry.js';
@@ -335,14 +335,15 @@ export default async function anthropicRoutes(fastify) {
             errorMessage = buildErrorMessage(error);
 
             const capacity = isCapacityError(error);
+            const serverCapacityExhausted = isServerCapacityExhaustedError(error);
             const authError = isAuthenticationError(error);
             const retryAfterMs = Number.isFinite(error?.retryAfterMs)
                 ? error.retryAfterMs
                 : parseResetAfterMs(error?.message);
 
-            if (account && capacity) {
+            if (account && capacity && !serverCapacityExhausted) {
                 accountPool.markCapacityLimited(account.id, model, error.message || '');
-            } else if (account && !authError && !error?.authHandled) {
+            } else if (account && !capacity && !authError && !error?.authHandled) {
                 accountPool.markAccountError(account.id, error);
             }
 

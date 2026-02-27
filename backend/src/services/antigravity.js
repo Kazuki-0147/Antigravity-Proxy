@@ -155,7 +155,12 @@ export async function streamChat(account, request, onData, onError, signal = nul
                 const blockReason = promptFeedback?.blockReason || promptFeedback?.blockReasonMessage;
 
                 if (upstreamError?.message) {
-                    throw new Error(upstreamError.message);
+                    const err = new Error(upstreamError.message);
+                    const code = Number(upstreamError?.code);
+                    if (Number.isFinite(code)) err.upstreamStatus = code;
+                    err.upstreamJson = parsed;
+                    err.upstreamBody = payload;
+                    throw err;
                 }
                 if (blockReason) {
                     throw new Error(`Upstream blocked request: ${blockReason}`);

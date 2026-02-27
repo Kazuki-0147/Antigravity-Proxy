@@ -532,8 +532,77 @@ body {
   flex: 1;
 }
 
+.dashboard-settings-card {
+  min-height: auto !important;
+}
+
+.threshold-form {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.threshold-hint {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.threshold-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.threshold-grid .form-label {
+  text-transform: none;
+}
+
+.threshold-actions {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.dashboard-routing-card {
+  min-height: auto !important;
+}
+
+.routing-list {
+  display: grid;
+  gap: 10px;
+}
+
+.routing-item {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  background: var(--color-surface-2);
+}
+
+.routing-group {
+  font-weight: 600;
+}
+
+.routing-account {
+  margin-top: 4px;
+  font-size: 13px;
+}
+
+.routing-meta,
+.routing-sticky {
+  margin-top: 3px;
+  font-size: 12px;
+}
+
 @media (max-width: 1000px) {
   .content-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .threshold-grid {
     grid-template-columns: 1fr;
   }
 }

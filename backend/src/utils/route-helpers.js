@@ -18,8 +18,55 @@ export function isCapacityError(err) {
         msg.includes('exhausted your capacity on this model') ||
         msg.includes('Resource has been exhausted') ||
         msg.includes('No capacity available') ||
-        err?.upstreamStatus === 429
+        err?.upstreamStatus === 429 ||
+        isServerCapacityExhaustedError(err)
     );
+}
+
+export function isServerCapacityExhaustedError(err) {
+    const message = String(err?.message || '');
+    const messageLower = message.toLowerCase();
+
+    const hasServerCapacityMessage =
+        messageLower.includes('no capacity available for model') &&
+        messageLower.includes('on the server');
+
+    const upstreamJson = err?.upstreamJson;
+    const upstreamError = upstreamJson?.error && typeof upstreamJson.error === 'object'
+        ? upstreamJson.error
+        : upstreamJson;
+
+    const upstreamStatus = Number(err?.upstreamStatus);
+    const upstreamCode = Number(upstreamError?.code);
+    const upstreamStatusText = String(upstreamError?.status || '').toUpperCase();
+
+    const detailReason = Array.isArray(upstreamError?.details)
+        ? upstreamError.details.some((d) => String(d?.reason || '').toUpperCase() === 'MODEL_CAPACITY_EXHAUSTED')
+        : false;
+
+    const bodyLower = String(err?.upstreamBody || '').toLowerCase();
+    const bodyReason = bodyLower.includes('model_capacity_exhausted');
+    const bodyServerCapacityMessage =
+        bodyLower.includes('no capacity available for model') &&
+        bodyLower.includes('on the server');
+
+    if (detailReason || bodyReason) return true;
+
+    if (hasServerCapacityMessage || bodyServerCapacityMessage) {
+        if (
+            upstreamStatus === 503 ||
+            upstreamCode === 503 ||
+            upstreamStatusText === 'UNAVAILABLE' ||
+            messageLower.includes('unavailable') ||
+            bodyLower.includes('"status":"unavailable"')
+        ) {
+            return true;
+        }
+        // Some upstream paths only surface the message without structured status fields.
+        return true;
+    }
+
+    return false;
 }
 
 /**
